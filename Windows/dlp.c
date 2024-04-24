@@ -68,16 +68,13 @@ static struct IMAGE image_map(const char *image)
 		img.error = GetLastError();
 		return img;
 	}
-	else if (!GetModuleInformation(GetCurrentProcess(), hModule, &info, sizeof(info)) )
-	{
-		FreeLibrary(hModule);
-		return img;
-	}
 
 	// LoadLibrary mapped everything properly so trust the headers
+	// Additionally, hModule uses low bits as flags so mask those off
+	// to get the base address. For all architectures we care about, page
+	// size is 4KiB.
 	img.module = hModule;
-	img.base = info.lpBaseOfDll;
-	img.size = info.SizeOfImage;
+	img.base = (void *)((uintptr_t)hModule & ~0xfff);
 	img.dos = (IMAGE_DOS_HEADER *)img.base;
 	img.nt = (union IMAGE_NT_HEADERS *)rva_to_va(img.dos, img.dos->e_lfanew);
 	switch (img.nt->h32.OptionalHeader.Magic)
@@ -85,11 +82,13 @@ static struct IMAGE image_map(const char *image)
             case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
 		    img.directories = &img.nt->h64.OptionalHeader.DataDirectory[0];
 		    img.dircnt = img.nt->h64.OptionalHeader.NumberOfRvaAndSizes;
+		    img.size = img.nt->h64.OptionalHeader.SizeOfImage;
 		    img.bits = 64;
 		    break;
 	    case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
 		    img.directories = &img.nt->h32.OptionalHeader.DataDirectory[0];
 		    img.dircnt = img.nt->h32.OptionalHeader.NumberOfRvaAndSizes;
+		    img.size = img.nt->h32.OptionalHeader.SizeOfImage;
 		    img.bits = 32;
 		    break;
 	    default:
@@ -233,6 +232,7 @@ static char **exports_from_image(struct IMAGE *image)
 __declspec(dllexport) int HelloWorld(void)
 {
 	printf("Hello World!\n");
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -245,7 +245,7 @@ int main(int argc, char **argv)
 	struct IMAGE image = image_map(dll);
 	if (!image.module)
 	{
-		fprintf(stderr, "Failed to map image!\n");
+		fprintf(stderr, "Failed to map image! %08x\n", image.error);
 		return 1;
 	}
 	printf("Mapped image properly!\n");
