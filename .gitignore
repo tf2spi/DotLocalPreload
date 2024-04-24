@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+
+# MSVC artifacts
+*.exp
+*.lib
+*.ilk
+*.pdb
