@@ -44,6 +44,12 @@ struct IMAGE
 };
 
 #define rva_to_va(b, rva) (void *)((uintptr_t)b + rva)
+#define aligned(ptr) !((uintptr_t)(ptr) & (uintptr_t)(sizeof(*(ptr)) - 1))
+
+static BOOL rva_size_bounded(uint32_t imgsize, uint32_t rva, uint32_t nmemb, uint32_t membsize)
+{
+	return rva < imgsize && (imgsize - rva) / membsize > nmemb;
+}
 
 static void image_unmap(struct IMAGE *image)
 {
@@ -100,7 +106,7 @@ static struct IMAGE image_map(const char *image)
 }
 
 
-static size_t exports_from_dir(const void *base, size_t size, const struct IMAGE_EXPORT_DIRECTORY *expdir, const char **exports, char *buffer, size_t buflen)
+static size_t exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, const char **exports, char *buffer, size_t buflen)
 {
 	if (expdir->NumberOfNames == 0)
 		return 0;
@@ -111,13 +117,13 @@ static size_t exports_from_dir(const void *base, size_t size, const struct IMAGE
 	uint16_t *ordinals = rva_to_va(base, expdir->AddressOfOrdinals);
 	uint32_t count = expdir->NumberOfNames;
 
-	// They must be in bounds for the image
+	// The tables must be in bounds for the image
 	// Not sure if they're allowed to be unaligned,
 	// but we don't implement that case.
-	if ((uintptr_t)names & 3
-		|| (uintptr_t)ordinals & 1
-		|| (size - expdir->AddressOfNames) / sizeof(*names) <= count
-		|| (size - expdir->AddressOfOrdinals) / sizeof(*ordinals) <= count)
+	if (!rva_size_bounded(imgsize, expdir->AddressOfNames, count, sizeof(*names))
+		|| !rva_size_bounded(imgsize, expdir->AddressOfOrdinals, count, sizeof(*ordinals))
+		|| !aligned(names)
+		|| !aligned(ordinals))
 	{
 		SetLastError(ERROR_INVALID_DATA);
 		return 0;
@@ -131,10 +137,10 @@ static size_t exports_from_dir(const void *base, size_t size, const struct IMAGE
 		const char *s;
 		size_t slen;
 
-		if (names[i] > 0 && names[i] < size)
+		if (names[i] > 0 && names[i] < imgsize)
 		{
 			s = (const char *)rva_to_va(base, names[i]);
-			slen = strnlen(s, size - names[i]);
+			slen = strnlen(s, imgsize - names[i]);
 		}
 		else
 		{
@@ -189,9 +195,8 @@ static char **exports_from_image(struct IMAGE *image)
 		return exports;
 	}
 
-	// Make sure that the export directory 
-	if (expdir.VirtualAddress > image->size
-		|| image->size - expdir.VirtualAddress < expdir.Size)
+	// Make sure that the export directory is inside the DLL
+	if (!rva_size_bounded(image->size, expdir.VirtualAddress, expdir.Size, 1))
 	{
 		image->error = ERROR_INVALID_DATA;
 		return NULL;
@@ -213,9 +218,9 @@ static char **exports_from_image(struct IMAGE *image)
 	}
 
 	char **exports = NULL;
-	if ((SIZE_MAX - tablesize) / sizeof(*exports) < directory.NumberOfNames)
+	if (!rva_size_bounded(SIZE_MAX - sizeof(*exports), tablesize, directory.NumberOfNames, sizeof(*exports)))
 	{
-		image->error = ERROR_INVALID_DATA;
+		image->error = ERROR_NOT_ENOUGH_MEMORY;
 		return NULL;
 	}
 	size_t vcnt = ((size_t)directory.NumberOfNames + 1);
