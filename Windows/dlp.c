@@ -7,6 +7,49 @@
 #include <winnt.h>
 #include <psapi.h>
 #include <assert.h>
+#include <stdarg.h>
+
+static int verrf(const char *fmt, va_list ap)
+{
+	fflush(stdout);
+	return vfprintf(stderr, fmt, ap);
+}
+
+static int errf(const char *fmt, ...)
+{
+	int n;
+	va_list ap;
+	va_start(ap, fmt);
+	n = verrf(fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+static int perrf(DWORD code, const char *fmt, ...)
+{
+	char msgerr[256];
+	int n;
+	va_list ap;
+	va_start(ap, fmt);
+	n = verrf(fmt, ap);
+	va_end(ap);
+	*msgerr = 0;
+	DWORD fmtlen = FormatMessageA(
+		FORMAT_MESSAGE_FROM_SYSTEM,
+		NULL,
+		code,
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+		msgerr,
+		sizeof(msgerr),
+		NULL);
+	n += errf(" (error code 0x%08X)\n", code);
+	return n;
+}
+
+#define DBGF(...) errf(__VA_ARGS__)
+#define ERRF(...) errf(__VA_ARGS__)
+#define PERRF(...) perrf(__VA_ARGS__)
+#define OUTF(...) printf(__VA_ARGS__)
 
 union IMAGE_NT_HEADERS
 {
@@ -104,7 +147,6 @@ static struct IMAGE image_map(const char *image)
 	}
 	return img;
 }
-
 
 static size_t exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, const char **exports, char *buffer, size_t buflen)
 {
@@ -236,35 +278,54 @@ static char **exports_from_image(struct IMAGE *image)
 
 __declspec(dllexport) int HelloWorld(void)
 {
-	printf("Hello World!\n");
+	OUTF("Hello World!\n");
 	return 0;
 }
 
-int main(int argc, char **argv)
+static const char **exports_from_path(const char *path)
 {
-	const char *dll = *argv;
-	if (argc > 1)
-	{
-		dll = argv[1];
-	}
-	struct IMAGE image = image_map(dll);
+	struct IMAGE image = image_map(path);
 	if (!image.module)
 	{
-		fprintf(stderr, "Failed to map image! %08x\n", image.error);
-		return 1;
+		PERRF(image.error, "Failed to map '%s' as DLL", path);
+		return NULL;
 	}
-	printf("Mapped image properly!\n");
+	OUTF("Image '%s' mapped!\n", path);
 	const char **exports = exports_from_image(&image);
 	image_unmap(&image);
 	if (exports == NULL)
 	{
-		fprintf(stderr, "Failed to get exports! %08X\n", image.error);
-		return 1;
+		PERRF(image.error, "Failed to get exports from '%s'", path);
+		return NULL;
 	}
-	printf("Got some exports!\n");
-	for (const char **iter = exports; *iter != NULL; iter++)
+	OUTF("Exports extracted from '%s'\n", path);
+	return exports;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc < 3)
 	{
-		printf("\t%s\n", *iter);
+		ERRF("Usage: %s PreloadDLL ReferenceDLL\n", *argv);
+		return EXIT_FAILURE;
+	}
+	const char *preload = argv[1];
+	const char *reference = argv[2];
+	const char **plexps = exports_from_path(preload);
+	if (plexps == NULL)
+		return EXIT_FAILURE;
+	OUTF("Preload exports:\n");
+	for (const char **iter = plexps; *iter != NULL; iter++)
+	{
+		OUTF("\t%s\n", *iter);
+	}
+	const char **refexps = exports_from_path(reference);
+	if (refexps == NULL)
+		return EXIT_FAILURE;
+	OUTF("Reference exports:\n");
+	for (const char **iter = refexps; *iter != NULL; iter++)
+	{
+		OUTF("\t%s\n", *iter);
 	}
 	return 0;
 }
