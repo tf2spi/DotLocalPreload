@@ -202,7 +202,7 @@ static struct IMAGE image_map(const char *image)
 	return img;
 }
 
-static char **exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir)
+static char **exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, size_t *expc)
 {
 	char **exports = NULL;
 	if (!rva_size_bounded(SIZE_MAX - sizeof(*exports), 0, expdir->NumberOfNames, sizeof(*exports)))
@@ -257,9 +257,11 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 		if (exports == NULL)
 			return NULL;
 
-		exports[i] = (char *)exports + prev; 
-		memcpy(exports[i], s, slen);
-		exports[i][slen] = 0;
+		// TODO: 
+		char *dst = (char *)exports + prev;
+		exports[i] = (char *)prev; 
+		memcpy(dst, s, slen);
+		dst[slen] = 0;
 	}
 	exports[count] = NULL;
 
@@ -270,10 +272,16 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 	{
 		exports = (const char **)tmp;
 	}
+	if (expc != NULL)
+	{
+		*expc = count;
+	}
+	for (const char **iter = exports; *iter; iter++)
+		*iter += (uintptr_t)exports;
 	return exports;
 }
 
-static char **exports_from_image(struct IMAGE *image, char *name)
+static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc)
 {
 	assert(image != NULL);
 	if (image->error)
@@ -335,7 +343,7 @@ static char **exports_from_image(struct IMAGE *image, char *name)
 
 	// They should be sorted but we're processing unverified input
 	// and we need to consider that ordinals are converted to names.
-	const char **exports = exports_from_dir(base, imgsize, &directory);
+	const char **exports = exports_from_dir(base, imgsize, &directory, expc);
 	if (exports != NULL)
 	{
 		sort_strtable(exports, directory.NumberOfNames);
@@ -349,7 +357,7 @@ __declspec(dllexport) int HelloWorld(void)
 	return 0;
 }
 
-static const char **exports_from_path(const char *path, char *name)
+static const char **exports_from_path(const char *path, char *name, size_t *expc)
 {
 	struct IMAGE image = image_map(path);
 	if (!image.module)
@@ -358,7 +366,7 @@ static const char **exports_from_path(const char *path, char *name)
 		return NULL;
 	}
 	OUTF("Image '%s' mapped!\n", path);
-	const char **exports = exports_from_image(&image, name);
+	const char **exports = exports_from_image(&image, name, expc);
 	image_unmap(&image);
 	if (exports == NULL)
 	{
@@ -367,6 +375,47 @@ static const char **exports_from_path(const char *path, char *name)
 	}
 	OUTF("Exports extracted from '%s'\n", path);
 	return exports;
+}
+
+static struct IMAGE_EXPORT_DIRECTORY *add_export(
+	struct IMAGE_EXPORT_DIRECTORY *dir,
+	size_t *diralloc,
+	size_t *dirbytes,
+	const char *dll,
+	const char *fn,
+	uint32_t i)
+{
+	if (dir == NULL)
+	{
+		return NULL;
+	}
+	if (*dirbytes > UINT32_MAX)
+	{
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		free(dir);
+		dir = NULL;
+	}
+	size_t grow = strlen(dll) + strlen(fn) + 2;
+	size_t ptr = *dirbytes;
+	dir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(dir, diralloc, dirbytes, grow);
+	if (dir == NULL)
+	{
+		return NULL;
+	}
+	char *s = (char *)dir + ptr;
+	snprintf(s, grow, "%s.%s", dll, fn);
+	((uint32_t *)(dir + 1))[i] = ptr;
+	return dir;
+}
+
+static char *strip_suffix(char *dll)
+{
+	char *suffix = strrchr(dll, '.');
+	if (suffix != NULL)
+	{
+		*suffix = 0;
+	}
+	return dll;
 }
 
 int main(int argc, char **argv)
@@ -381,19 +430,48 @@ int main(int argc, char **argv)
 	char refname[MAX_PATH];
 	const char *preload = argv[1];
 	const char *reference = argv[2];
-	const char **plexps = exports_from_path(preload, prename);
+	size_t plexpc = 0;
+	size_t refexpc = 0;
+	const char **plexps = exports_from_path(preload, prename, &plexpc);
 	if (plexps == NULL)
 	{
 		return EXIT_FAILURE;
 	}
 	for (const char **iter = plexps; *iter; iter++)
 		OUTF("\t%s\n", *iter);
-	const char **refexps = exports_from_path(reference, refname);
+	const char **refexps = exports_from_path(reference, refname, &refexpc);
 	if (refexps == NULL)
 	{
 		return EXIT_FAILURE;
 	}
 	for (const char **iter = refexps; *iter; iter++)
 		OUTF("\t%s\n", *iter);
+
+	struct IMAGE_EXPORT_DIRECTORY *expdir = NULL;
+	size_t expdirbytes = 0;
+	size_t expdiralloc = 0;
+
+	if (!rva_size_bounded(SIZE_MAX, sizeof(*expdir), refexpc, sizeof(uint32_t)))
+	{
+		ERRF("Number of exports too big to fit in memory!\n");
+		return EXIT_FAILURE;
+	}
+	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(
+		NULL, &expdirbytes, &expdiralloc,
+		sizeof(*expdir) + refexpc * sizeof(uint32_t));
+	uint32_t *rvas = (uint32_t *)(expdir + 1);
+
+	strip_suffix(prename);
+	strip_suffix(refname);
+	for (size_t i = 0; i < refexpc; i++)
+	{
+		expdir = add_export(expdir, &expdirbytes, &expdiralloc, refname, refexps[i], i);
+		if (expdir == NULL)
+		{
+			PERRF(GetLastError(), "Failed to add export '%s' to forwarder exports!");
+			return EXIT_FAILURE;
+		}
+		OUTF("Added export '%s'\n", (const char *)expdir + ((uint32_t *)(expdir + 1))[i]);
+	}
 	return 0;
 }
