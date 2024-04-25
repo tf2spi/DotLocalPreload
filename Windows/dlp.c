@@ -94,6 +94,14 @@ static BOOL rva_size_bounded(uint32_t imgsize, uint32_t rva, uint32_t nmemb, uin
 	return rva < imgsize && (imgsize - rva) / membsize > nmemb;
 }
 
+static int sort_string(void *unused, const void *lhs, const void *rhs)
+{
+	(void)unused;
+	return strcmp(*(const char **)lhs, *(const char **)rhs);
+}
+
+#define sort_strtable(table, count) qsort_s((table), (count), sizeof(*(table)), sort_string, NULL)
+
 static void image_unmap(struct IMAGE *image)
 {
 	if (image != NULL)
@@ -207,7 +215,7 @@ static size_t exports_from_dir(const void *base, size_t imgsize, const struct IM
 	return total;
 }
 
-static char **exports_from_image(struct IMAGE *image)
+static char **exports_from_image(struct IMAGE *image, char *name)
 {
 	assert(image != NULL);
 	if (image->error)
@@ -251,6 +259,20 @@ static char **exports_from_image(struct IMAGE *image)
 	memcpy(&directory,
 		(struct IMAGE_EXPORT_DIRECTORY *)rva_to_va(base, expdir.VirtualAddress),
 		sizeof(directory));
+	if (name != NULL)
+	{
+		if (directory.Name > imgsize)
+		{
+			image->error = ERROR_INVALID_DATA;
+			return NULL;
+		}
+		const char *imgname = (const char *)rva_to_va(base, directory.Name);
+		DWORD slen = strnlen(imgname, imgsize - directory.Name);
+		if (slen > MAX_PATH - 1)
+			slen = MAX_PATH - 1;
+		memcpy(name, imgname, slen);
+		name[slen] = 0;
+	}
 
 	size_t tablesize = exports_from_dir(base, imgsize, &directory, NULL, NULL, 0);
 	if (tablesize == 0 && directory.NumberOfNames != 0)
@@ -273,6 +295,10 @@ static char **exports_from_image(struct IMAGE *image)
 		return NULL;
 	}
 	exports_from_dir(base, imgsize, &directory, exports, (char *)&exports[vcnt], tablesize);
+
+	// They should be sorted but we're processing unverified input
+	// and we need to consider that ordinals are converted to names.
+	sort_strtable(exports, directory.NumberOfNames);
 	return exports;
 }
 
@@ -282,7 +308,7 @@ __declspec(dllexport) int HelloWorld(void)
 	return 0;
 }
 
-static const char **exports_from_path(const char *path)
+static const char **exports_from_path(const char *path, char *name)
 {
 	struct IMAGE image = image_map(path);
 	if (!image.module)
@@ -291,7 +317,7 @@ static const char **exports_from_path(const char *path)
 		return NULL;
 	}
 	OUTF("Image '%s' mapped!\n", path);
-	const char **exports = exports_from_image(&image);
+	const char **exports = exports_from_image(&image, name);
 	image_unmap(&image);
 	if (exports == NULL)
 	{
@@ -309,20 +335,23 @@ int main(int argc, char **argv)
 		ERRF("Usage: %s PreloadDLL ReferenceDLL\n", *argv);
 		return EXIT_FAILURE;
 	}
+
+	char prename[MAX_PATH];
+	char refname[MAX_PATH];
 	const char *preload = argv[1];
 	const char *reference = argv[2];
-	const char **plexps = exports_from_path(preload);
+	const char **plexps = exports_from_path(preload, prename);
 	if (plexps == NULL)
 		return EXIT_FAILURE;
-	OUTF("Preload exports:\n");
+	OUTF("Preload exports (%s):\n", prename);
 	for (const char **iter = plexps; *iter != NULL; iter++)
 	{
 		OUTF("\t%s\n", *iter);
 	}
-	const char **refexps = exports_from_path(reference);
+	const char **refexps = exports_from_path(reference, refname);
 	if (refexps == NULL)
 		return EXIT_FAILURE;
-	OUTF("Reference exports:\n");
+	OUTF("Reference exports (%s):\n", refname);
 	for (const char **iter = refexps; *iter != NULL; iter++)
 	{
 		OUTF("\t%s\n", *iter);
