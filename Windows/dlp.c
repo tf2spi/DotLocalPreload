@@ -102,6 +102,52 @@ static int sort_string(void *unused, const void *lhs, const void *rhs)
 
 #define sort_strtable(table, count) qsort_s((table), (count), sizeof(*(table)), sort_string, NULL)
 
+// Free the memory if the grow fails
+static void *dynmem_grow(void *mem, size_t *allocated, size_t *prevsize, size_t grow)
+{
+	assert(allocated != NULL && prevsize != NULL);
+	size_t alloc = *allocated;
+	size_t newsize = *prevsize;
+	if (SIZE_MAX - newsize < grow)
+	{
+		SetLastError(ERROR_INSUFFICIENT_BUFFER);
+		free(mem);
+		return NULL;
+	}
+	newsize += grow;
+	if (mem == NULL)
+	{
+		mem = malloc(grow);
+		if (mem == NULL)
+		{
+			SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+			return NULL;
+		}
+		*prevsize = grow;
+		*allocated = newsize;
+		return mem;
+	}
+	if (newsize > alloc)
+	{
+		if (newsize > (SIZE_MAX >> 1))
+		{
+			free(mem);
+			return NULL;
+		}
+		alloc = newsize << 1;
+		void *tmp = realloc(mem, alloc);
+		if (tmp == NULL)
+		{
+			free(mem);
+			return NULL;
+		}
+		mem = tmp;
+		*allocated = alloc;
+	}
+	*prevsize = newsize;
+	return mem;
+}
+
 static void image_unmap(struct IMAGE *image)
 {
 	if (image != NULL)
@@ -156,16 +202,27 @@ static struct IMAGE image_map(const char *image)
 	return img;
 }
 
-static size_t exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, const char **exports, char *buffer, size_t buflen)
+static char **exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir)
 {
-	if (expdir->NumberOfNames == 0)
-		return 0;
-
-	if (buffer == NULL)
-		buflen = 0;
+	char **exports = NULL;
+	if (!rva_size_bounded(SIZE_MAX - sizeof(*exports), 0, expdir->NumberOfNames, sizeof(*exports)))
+	{
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return NULL;
+	}
 	uint32_t *names = rva_to_va(base, expdir->AddressOfNames);
 	uint16_t *ordinals = rva_to_va(base, expdir->AddressOfOrdinals);
-	uint32_t count = expdir->NumberOfNames;
+	size_t count = expdir->NumberOfNames;
+
+	size_t expalloc = 0;
+	size_t expbytes = 0;
+	exports = (char **)dynmem_grow(NULL, &expalloc, &expbytes, (count + 1) * sizeof(*exports));
+	if (exports == NULL)
+	{
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return NULL;
+	}
+
 
 	// The tables must be in bounds for the image
 	// Not sure if they're allowed to be unaligned,
@@ -179,8 +236,6 @@ static size_t exports_from_dir(const void *base, size_t imgsize, const struct IM
 		return 0;
 	}
 
-	size_t bufi = 0;
-	size_t total = 0;
 	for (uint32_t i = 0; i < count; i++)
 	{
 		char ord[8];
@@ -194,25 +249,28 @@ static size_t exports_from_dir(const void *base, size_t imgsize, const struct IM
 		}
 		else
 		{
-			slen = snprintf(ord, sizeof(ord), "#%u", (uint16_t)ordinals[i]);
+			slen = snprintf(ord, sizeof(ord), "#%hu", ordinals[i] + expdir->Base);
 			s = ord;
 		}
-		total += slen + 1;
-		if (bufi >= buflen)
-			continue;
+		size_t prev = expbytes;
+		exports = (char **)dynmem_grow(exports, &expalloc, &expbytes, slen + 1);
+		if (exports == NULL)
+			return NULL;
 
-		size_t ncopy = buflen - bufi - 1;
-		if (slen < ncopy)
-			ncopy = slen;
-		memcpy(buffer + bufi, s, ncopy);
-		buffer[bufi + ncopy] = 0;
-		if (exports != NULL)
-			exports[i] = &buffer[bufi];
-		bufi += ncopy + 1;
+		exports[i] = (char *)exports + prev; 
+		memcpy(exports[i], s, slen);
+		exports[i][slen] = 0;
 	}
-	if (exports != NULL)
-		exports[count] = NULL;
-	return total;
+	exports[count] = NULL;
+
+	// realloc is still free to move memory or fail
+	// while shrinking memory so check for that.
+	void *tmp = realloc(exports, expbytes);
+	if (tmp != NULL)
+	{
+		exports = (const char **)tmp;
+	}
+	return exports;
 }
 
 static char **exports_from_image(struct IMAGE *image, char *name)
@@ -230,10 +288,10 @@ static char **exports_from_image(struct IMAGE *image, char *name)
 
 	// If export directory not present, assume
 	// it's because there are no exports
-	IMAGE_DATA_DIRECTORY expdir = image->directories[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	IMAGE_DATA_DIRECTORY *expdirptr = &image->directories[IMAGE_DIRECTORY_ENTRY_EXPORT];
 	if (image->dircnt <= IMAGE_DIRECTORY_ENTRY_EXPORT
-		|| expdir.VirtualAddress == 0
-		|| expdir.Size < sizeof(struct IMAGE_EXPORT_DIRECTORY))
+		|| expdirptr->VirtualAddress == 0
+		|| expdirptr->Size < sizeof(struct IMAGE_EXPORT_DIRECTORY))
 	{
 		char **exports = malloc(sizeof(*exports));
 		if (exports == NULL)
@@ -244,6 +302,7 @@ static char **exports_from_image(struct IMAGE *image, char *name)
 		*exports = NULL;
 		return exports;
 	}
+	IMAGE_DATA_DIRECTORY expdir = *expdirptr;
 
 	// Make sure that the export directory is inside the DLL
 	if (!rva_size_bounded(image->size, expdir.VirtualAddress, expdir.Size, 1))
@@ -274,31 +333,13 @@ static char **exports_from_image(struct IMAGE *image, char *name)
 		name[slen] = 0;
 	}
 
-	size_t tablesize = exports_from_dir(base, imgsize, &directory, NULL, NULL, 0);
-	if (tablesize == 0 && directory.NumberOfNames != 0)
-	{
-		image->error = ERROR_INVALID_DATA;
-		return NULL;
-	}
-
-	char **exports = NULL;
-	if (!rva_size_bounded(SIZE_MAX - sizeof(*exports), tablesize, directory.NumberOfNames, sizeof(*exports)))
-	{
-		image->error = ERROR_NOT_ENOUGH_MEMORY;
-		return NULL;
-	}
-	size_t vcnt = ((size_t)directory.NumberOfNames + 1);
-	exports = (const char **)malloc(vcnt * sizeof(*exports) + tablesize);
-	if (exports == NULL)
-	{
-		image->error = ERROR_NOT_ENOUGH_MEMORY;
-		return NULL;
-	}
-	exports_from_dir(base, imgsize, &directory, exports, (char *)&exports[vcnt], tablesize);
-
 	// They should be sorted but we're processing unverified input
 	// and we need to consider that ordinals are converted to names.
-	sort_strtable(exports, directory.NumberOfNames);
+	const char **exports = exports_from_dir(base, imgsize, &directory);
+	if (exports != NULL)
+	{
+		sort_strtable(exports, directory.NumberOfNames);
+	}
 	return exports;
 }
 
@@ -342,19 +383,17 @@ int main(int argc, char **argv)
 	const char *reference = argv[2];
 	const char **plexps = exports_from_path(preload, prename);
 	if (plexps == NULL)
-		return EXIT_FAILURE;
-	OUTF("Preload exports (%s):\n", prename);
-	for (const char **iter = plexps; *iter != NULL; iter++)
 	{
-		OUTF("\t%s\n", *iter);
+		return EXIT_FAILURE;
 	}
+	for (const char **iter = plexps; *iter; iter++)
+		OUTF("\t%s\n", *iter);
 	const char **refexps = exports_from_path(reference, refname);
 	if (refexps == NULL)
-		return EXIT_FAILURE;
-	OUTF("Reference exports (%s):\n", refname);
-	for (const char **iter = refexps; *iter != NULL; iter++)
 	{
-		OUTF("\t%s\n", *iter);
+		return EXIT_FAILURE;
 	}
+	for (const char **iter = refexps; *iter; iter++)
+		OUTF("\t%s\n", *iter);
 	return 0;
 }
