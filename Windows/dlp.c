@@ -9,7 +9,7 @@
 #include <assert.h>
 #include <stdarg.h>
 
-#define INSTALL_DIR "install.local"
+#define INSTALL_DIR "install.exe.local"
 const uint32_t DOS_STUB[] = 
 {
     0x00905a4d, 0x00000003, 0x00000004, 0x0000ffff,
@@ -676,13 +676,13 @@ int main(int argc, char **argv)
 	memcpy(hdr.dos, DOS_STUB, sizeof(DOS_STUB));
 	uint32_t headsize = offsetof(struct fwdheader, alignend);
 	uint32_t sectalign = 0x1000;
-	uint32_t imgsize = headsize + mem.size;
-	if (imgsize < headsize || !alignup(imgsize, sectalign))
+	uint32_t filesize = headsize + mem.size;
+	if (filesize < headsize || !alignup(filesize, sectalign))
 	{
 		ERRF("Export directory too big for exporting!\n");
 		return EXIT_FAILURE;
 	}
-	imgsize = alignup(imgsize, sectalign);
+	filesize = alignup(filesize, FILE_ALIGN);
 	uint32_t count = expdir->NumberOfNames;
 	uint32_t names_rva = expdir->AddressOfNames;
 	uint32_t exports_rva = expdir->AddressOfExports;
@@ -714,7 +714,7 @@ int main(int argc, char **argv)
 			h64->ImageBase = imgbase;
 			h64->SectionAlignment = sectalign;
 			h64->FileAlignment = FILE_ALIGN;
-			h64->SizeOfImage = imgsize;
+			h64->SizeOfImage = alignup(filesize, sectalign);
 			h64->SizeOfHeaders = headsize;
 			h64->CheckSum = 0;
 			h64->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
@@ -731,7 +731,7 @@ int main(int argc, char **argv)
 			h32->ImageBase = imgbase;
 			h32->SectionAlignment = sectalign;
 			h32->FileAlignment = FILE_ALIGN;
-			h32->SizeOfImage = imgsize;
+			h32->SizeOfImage = alignup(filesize, sectalign);
 			h32->SizeOfHeaders = headsize;
 			h32->CheckSum = 0;
 			h32->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
@@ -747,15 +747,15 @@ int main(int argc, char **argv)
 	memset(pad, 0, sizeof(pad));
 	strcpy(hdr.shdrs->Name, ".edata");
 	hdr.shdrs->Misc.VirtualSize = mem.size;
-	hdr.shdrs->VirtualAddress = imgbase + sectalign;
+	hdr.shdrs->VirtualAddress = 0;
 	hdr.shdrs->SizeOfRawData = mem.size + padlen;
-	hdr.shdrs->PointerToRawData = headsize;
+	hdr.shdrs->PointerToRawData = 0;
 	hdr.shdrs->PointerToRelocations = 0;
 	hdr.shdrs->PointerToLinenumbers = 0;
 	hdr.shdrs->NumberOfRelocations = 0;
 	hdr.shdrs->NumberOfLinenumbers = 0;
 	hdr.shdrs->Characteristics = 0x40000040;
-	datadir->VirtualAddress = hdr.shdrs->VirtualAddress;
+	datadir->VirtualAddress = headsize;
 	datadir->Size = hdr.shdrs->Misc.VirtualSize;
 
 	OUTF("Headsize: %d\n", headsize);
