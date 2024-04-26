@@ -678,27 +678,14 @@ int main(int argc, char **argv)
 	memcpy(hdr.dos, DOS_STUB, sizeof(DOS_STUB));
 	uint32_t headsize = offsetof(struct fwdheader, alignend);
 	uint32_t sectalign = 0x1000;
-	uint32_t filesize = headsize + mem.size;
-	if (filesize < headsize || !alignup(filesize, sectalign))
+	uint32_t filesize = alignup(headsize + mem.size, FILE_ALIGN);
+	uint32_t imgsize = alignup(headsize, sectalign) + alignup(mem.size, sectalign);
+	if (filesize < headsize || imgsize < filesize)
 	{
 		ERRF("Export directory too big for exporting!\n");
 		return EXIT_FAILURE;
 	}
-	filesize = alignup(filesize, FILE_ALIGN);
-	uint32_t count = expdir->NumberOfNames;
-	uint32_t names_rva = expdir->AddressOfNames;
-	uint32_t exports_rva = expdir->AddressOfExports;
-	for (uint32_t i = 0; i < count; i++)
-	{
-		((uint32_t *)rva_to_va(expdir, names_rva))[i] += headsize;
-		((uint32_t *)rva_to_va(expdir, exports_rva))[i] += headsize;
-	}
-	uint32_t imgbase = 0x10000000;
-	uint32_t imgsize = alignup(filesize, sectalign);
-	expdir->Name += headsize;
-	expdir->AddressOfNames += headsize;
-	expdir->AddressOfExports += headsize;
-	expdir->AddressOfOrdinals += headsize;
+	uint64_t imgbase = (uint64_t)0x180000000;
 	IMAGE_FILE_HEADER *filhdr = &hdr.nt.h64.FileHeader;
 	filhdr->NumberOfSections = ARRAYSIZE(hdr.shdrspace);
 	filhdr->PointerToSymbolTable = 0;
@@ -710,10 +697,10 @@ int main(int argc, char **argv)
 		case sizeof(hdr.nt.h64):
 			IMAGE_OPTIONAL_HEADER64 *h64 = &hdr.nt.h64.OptionalHeader;
 			h64->SizeOfCode = 0;
-			h64->SizeOfInitializedData = mem.size;
+			h64->SizeOfInitializedData = filesize - headsize;
 			h64->SizeOfUninitializedData = 0;
 			h64->AddressOfEntryPoint = 0;
-			h64->BaseOfCode = imgsize;
+			h64->BaseOfCode = sectalign;
 			h64->ImageBase = imgbase;
 			h64->SectionAlignment = sectalign;
 			h64->FileAlignment = FILE_ALIGN;
@@ -727,10 +714,10 @@ int main(int argc, char **argv)
 		case sizeof(hdr.nt.h32):
 			IMAGE_OPTIONAL_HEADER32 *h32 = &hdr.nt.h32.OptionalHeader;
 			h32->SizeOfCode = 0;
-			h32->SizeOfInitializedData = mem.size;
+			h32->SizeOfInitializedData = filesize - headsize;
 			h32->SizeOfUninitializedData = 0;
 			h32->AddressOfEntryPoint = 0;
-			h32->BaseOfCode = imgsize;
+			h32->BaseOfCode = sectalign;
 			h32->ImageBase = imgbase;
 			h32->SectionAlignment = sectalign;
 			h32->FileAlignment = FILE_ALIGN;
@@ -745,23 +732,33 @@ int main(int argc, char **argv)
 	size_t padlen = FILE_ALIGN - (mem.size & (FILE_ALIGN - 1));
 	if (padlen == FILE_ALIGN)
 		padlen = 0;
-	OUTF("Section: %zx %zx %zx %zx\n", padlen + mem.size, mem.size, padlen, alignup(mem.size, FILE_ALIGN));
 	uint8_t pad[FILE_ALIGN - 1];
 	memset(pad, 0, sizeof(pad));
-	strncpy(hdr.shdrs->Name, ".text", sizeof(hdr.shdrs->Name));
+	strncpy(hdr.shdrs->Name, ".rdata", sizeof(hdr.shdrs->Name));
 	hdr.shdrs->Misc.VirtualSize = mem.size;
-	hdr.shdrs->VirtualAddress = alignup(headsize, sectalign);
+	hdr.shdrs->VirtualAddress = sectalign;
 	hdr.shdrs->SizeOfRawData = mem.size + padlen;
 	hdr.shdrs->PointerToRawData = headsize;
 	hdr.shdrs->PointerToRelocations = 0;
 	hdr.shdrs->PointerToLinenumbers = 0;
 	hdr.shdrs->NumberOfRelocations = 0;
 	hdr.shdrs->NumberOfLinenumbers = 0;
-	hdr.shdrs->Characteristics = 0x60000060;
+	hdr.shdrs->Characteristics = 0x40000040;
 	datadir->VirtualAddress = hdr.shdrs->VirtualAddress;
 	datadir->Size = mem.size;
+	uint32_t count = expdir->NumberOfNames;
+	uint32_t names_rva = expdir->AddressOfNames;
+	uint32_t exports_rva = expdir->AddressOfExports;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		((uint32_t *)rva_to_va(expdir, names_rva))[i] += datadir->VirtualAddress;
+		((uint32_t *)rva_to_va(expdir, exports_rva))[i] += datadir->VirtualAddress;
+	}
+	expdir->Name += datadir->VirtualAddress;
+	expdir->AddressOfNames += datadir->VirtualAddress;
+	expdir->AddressOfExports += datadir->VirtualAddress;
+	expdir->AddressOfOrdinals += datadir->VirtualAddress;
 
-	OUTF("Headsize: %d\n", headsize);
 	if (!WriteFileExact(hFile, &hdr, headsize)
 		|| !WriteFileExact(hFile, expdir, mem.size)
 		|| !WriteFileExact(hFile, pad, padlen))
