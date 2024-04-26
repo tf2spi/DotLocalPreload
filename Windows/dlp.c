@@ -9,6 +9,29 @@
 #include <assert.h>
 #include <stdarg.h>
 
+#define INSTALL_DIR "install.local"
+const uint32_t DOS_STUB[] = 
+{
+    0x00905a4d, 0x00000003, 0x00000004, 0x0000ffff,
+    0x000000b8, 0x00000000, 0x00000040, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+                                        // e_lfanew
+    0x00000000, 0x00000000, 0x00000000, 0x00000108,
+    0x0eba1f0e, 0xcd09b400, 0x4c01b821, 0x685421cd,
+    0x70207369, 0x72676f72, 0x63206d61, 0x6f6e6e61,
+    0x65622074, 0x6e757220, 0x206e6920, 0x20534f44,
+    0x65646f6d, 0x0a0d0d2e, 0x00000024, 0x00000000,
+    0x4841d208, 0x1b2fb34c, 0x1b2fb34c, 0x1b2fb34c,
+    0x1a2ccb07, 0x1b2fb345, 0x1a2acb07, 0x1b2fb3de,
+    0x1a2bcb07, 0x1b2fb346, 0x1b2fb34c, 0x1b2fb34d,
+    0x1a2ecb07, 0x1b2fb34f, 0x1b2eb34c, 0x1b2fb311,
+    0x1a2a328e, 0x1b2fb364, 0x1a2b328e, 0x1b2fb35c,
+    0x1a2c328e, 0x1b2fb35d, 0x1a2b31be, 0x1b2fb34d,
+    0x1a2f31be, 0x1b2fb34d, 0x1a2d31be, 0x1b2fb34d,
+    0x68636952, 0x1b2fb34c, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000,
+};
+
 static int verrf(const char *fmt, va_list ap)
 {
 	fflush(stdout);
@@ -72,18 +95,45 @@ struct IMAGE_EXPORT_DIRECTORY
 	DWORD AddressOfOrdinals;
 };
 
-
 struct IMAGE
 {
 	HMODULE module;
 	void *base;
 	uint32_t size;
-	uint32_t bits;
+	uint32_t opthdrsize;
+	uint32_t nthdrsize;
 	IMAGE_DOS_HEADER *dos;
 	union IMAGE_NT_HEADERS *nt;
 	IMAGE_DATA_DIRECTORY *directories;
 	uint32_t dircnt;
 	uint32_t error;
+};
+
+#define FWDHDR_BASE \
+	uint8_t dos[sizeof(DOS_STUB)]; \
+	union IMAGE_NT_HEADERS nt; \
+	IMAGE_SECTION_HEADER shdrspace[1]; \
+	IMAGE_EXPORT_DIRECTORY expspace; \
+	uint32_t opthdrsize; \
+	uint32_t ntsize; \
+	uint32_t size
+
+#define FILE_ALIGN 512
+
+struct fwdheader_base
+{
+	FWDHDR_BASE;
+};
+
+struct fwdheader
+{
+	FWDHDR_BASE;
+	uint8_t alignment[2 * FILE_ALIGN - sizeof(struct fwdheader_base)];
+	uint8_t alignend;
+	union IMAGE_NT_HEADERS *headers;
+	IMAGE_DATA_DIRECTORY *directories;
+	struct IMAGE_EXPORT_DIRECTORY *exports;
+	IMAGE_SECTION_HEADER *shdrs;
 };
 
 #define rva_to_va(b, rva) (void *)((uintptr_t)b + rva)
@@ -101,51 +151,69 @@ static int sort_string(void *unused, const void *lhs, const void *rhs)
 }
 
 #define sort_strtable(table, count) qsort_s((table), (count), sizeof(*(table)), sort_string, NULL)
+#define search_strtable(table, count, needle) ((char **)bsearch_s(&(needle), (table), (count), sizeof(*(table)), sort_string, NULL))
 
 // Free the memory if the grow fails
-static void *dynmem_grow(void *mem, size_t *allocated, size_t *prevsize, size_t grow)
+#define DYNMEM_INIT {NULL, 0, 0}
+struct dynmem
 {
-	assert(allocated != NULL && prevsize != NULL);
-	size_t alloc = *allocated;
-	size_t newsize = *prevsize;
+	void *mem;
+	size_t allocated;
+	size_t size;
+};
+static void dynmem_free(struct dynmem *dynmem)
+{
+	assert(dynmem != NULL);
+	free(dynmem->mem);
+	dynmem->mem = NULL;
+	dynmem->allocated = 0;
+	dynmem->size = 0;
+}
+static void *dynmem_grow(struct dynmem *dynmem, size_t grow)
+{
+	assert(dynmem != NULL);
+	size_t alloc = dynmem->allocated;
+	size_t newsize = dynmem->size;
 	if (SIZE_MAX - newsize < grow)
 	{
 		SetLastError(ERROR_INSUFFICIENT_BUFFER);
-		free(mem);
+		dynmem_free(dynmem);
 		return NULL;
 	}
 	newsize += grow;
-	if (mem == NULL)
+	if (dynmem->mem == NULL)
 	{
-		mem = malloc(grow);
-		if (mem == NULL)
+		dynmem->mem = malloc(grow);
+		if (dynmem->mem == NULL)
 		{
 			SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+			dynmem->allocated = 0;
+			dynmem->size = 0;
 			return NULL;
 		}
-		*prevsize = grow;
-		*allocated = newsize;
-		return mem;
+		dynmem->size = grow;
+		dynmem->allocated = newsize;
+		return dynmem->mem;
 	}
 	if (newsize > alloc)
 	{
 		if (newsize > (SIZE_MAX >> 1))
 		{
-			free(mem);
+			dynmem_free(dynmem);
 			return NULL;
 		}
 		alloc = newsize << 1;
-		void *tmp = realloc(mem, alloc);
+		void *tmp = realloc(dynmem->mem, alloc);
 		if (tmp == NULL)
 		{
-			free(mem);
+			dynmem_free(dynmem->mem);
 			return NULL;
 		}
-		mem = tmp;
-		*allocated = alloc;
+		dynmem->mem = tmp;
+		dynmem->allocated = alloc;
 	}
-	*prevsize = newsize;
-	return mem;
+	dynmem->size = newsize;
+	return dynmem->mem;
 }
 
 static void image_unmap(struct IMAGE *image)
@@ -186,13 +254,15 @@ static struct IMAGE image_map(const char *image)
 		    img.directories = &img.nt->h64.OptionalHeader.DataDirectory[0];
 		    img.dircnt = img.nt->h64.OptionalHeader.NumberOfRvaAndSizes;
 		    img.size = img.nt->h64.OptionalHeader.SizeOfImage;
-		    img.bits = 64;
+		    img.nthdrsize = sizeof(img.nt->h64);
+		    img.opthdrsize = sizeof(img.nt->h64.OptionalHeader);
 		    break;
 	    case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
 		    img.directories = &img.nt->h32.OptionalHeader.DataDirectory[0];
 		    img.dircnt = img.nt->h32.OptionalHeader.NumberOfRvaAndSizes;
 		    img.size = img.nt->h32.OptionalHeader.SizeOfImage;
-		    img.bits = 32;
+		    img.nthdrsize = sizeof(img.nt->h32);
+		    img.opthdrsize = sizeof(img.nt->h32.OptionalHeader);
 		    break;
 	    default:
 		    // Resets to default values so nothing is returned
@@ -204,6 +274,7 @@ static struct IMAGE image_map(const char *image)
 
 static char **exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, size_t *expc)
 {
+	struct dynmem mem = DYNMEM_INIT;
 	char **exports = NULL;
 	if (!rva_size_bounded(SIZE_MAX - sizeof(*exports), 0, expdir->NumberOfNames, sizeof(*exports)))
 	{
@@ -214,9 +285,7 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 	uint16_t *ordinals = rva_to_va(base, expdir->AddressOfOrdinals);
 	size_t count = expdir->NumberOfNames;
 
-	size_t expalloc = 0;
-	size_t expbytes = 0;
-	exports = (char **)dynmem_grow(NULL, &expalloc, &expbytes, (count + 1) * sizeof(*exports));
+	exports = (char **)dynmem_grow(&mem, (count + 1) * sizeof(*exports));
 	if (exports == NULL)
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -225,15 +294,22 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 
 
 	// The tables must be in bounds for the image
-	// Not sure if they're allowed to be unaligned,
-	// but we don't implement that case.
 	if (!rva_size_bounded(imgsize, expdir->AddressOfNames, count, sizeof(*names))
 		|| !rva_size_bounded(imgsize, expdir->AddressOfOrdinals, count, sizeof(*ordinals))
 		|| !aligned(names)
 		|| !aligned(ordinals))
 	{
 		SetLastError(ERROR_INVALID_DATA);
-		return 0;
+		return NULL;
+	}
+
+	// Not sure if they're allowed to be unaligned,
+	// so check but don't implement that case.
+	if (!aligned(names) || !aligned(ordinals))
+	{
+		ERRF("Reading unaligned names and ordinals in export section unimplemented!\n");
+		SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+		return NULL;
 	}
 
 	for (uint32_t i = 0; i < count; i++)
@@ -249,15 +325,14 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 		}
 		else
 		{
-			slen = snprintf(ord, sizeof(ord), "#%hu", ordinals[i] + expdir->Base);
+			slen = sprintf(ord, "#%hu", (uint16_t)(ordinals[i] + expdir->Base));
 			s = ord;
 		}
-		size_t prev = expbytes;
-		exports = (char **)dynmem_grow(exports, &expalloc, &expbytes, slen + 1);
+		size_t prev = mem.size;
+		exports = (char **)dynmem_grow(&mem, slen + 1);
 		if (exports == NULL)
 			return NULL;
 
-		// TODO: 
 		char *dst = (char *)exports + prev;
 		exports[i] = (char *)prev; 
 		memcpy(dst, s, slen);
@@ -267,7 +342,7 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 
 	// realloc is still free to move memory or fail
 	// while shrinking memory so check for that.
-	void *tmp = realloc(exports, expbytes);
+	void *tmp = realloc(exports, mem.size);
 	if (tmp != NULL)
 	{
 		exports = (const char **)tmp;
@@ -278,10 +353,11 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 	}
 	for (const char **iter = exports; *iter; iter++)
 		*iter += (uintptr_t)exports;
+	sort_strtable(exports, expdir->NumberOfNames);
 	return exports;
 }
 
-static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc)
+static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc, struct IMAGE_EXPORT_DIRECTORY *dirp)
 {
 	assert(image != NULL);
 	if (image->error)
@@ -326,6 +402,10 @@ static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc)
 	memcpy(&directory,
 		(struct IMAGE_EXPORT_DIRECTORY *)rva_to_va(base, expdir.VirtualAddress),
 		sizeof(directory));
+	if (dirp != NULL)
+	{
+		*dirp = directory;
+	}
 	if (name != NULL)
 	{
 		if (directory.Name > imgsize)
@@ -343,12 +423,7 @@ static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc)
 
 	// They should be sorted but we're processing unverified input
 	// and we need to consider that ordinals are converted to names.
-	const char **exports = exports_from_dir(base, imgsize, &directory, expc);
-	if (exports != NULL)
-	{
-		sort_strtable(exports, directory.NumberOfNames);
-	}
-	return exports;
+	return exports_from_dir(base, imgsize, &directory, expc);
 }
 
 __declspec(dllexport) int HelloWorld(void)
@@ -357,7 +432,7 @@ __declspec(dllexport) int HelloWorld(void)
 	return 0;
 }
 
-static const char **exports_from_path(const char *path, char *name, size_t *expc)
+static const char **exports_from_path(const char *path, char *name, size_t *expc, struct fwdheader *hdr)
 {
 	struct IMAGE image = image_map(path);
 	if (!image.module)
@@ -366,7 +441,21 @@ static const char **exports_from_path(const char *path, char *name, size_t *expc
 		return NULL;
 	}
 	OUTF("Image '%s' mapped!\n", path);
-	const char **exports = exports_from_image(&image, name, expc);
+	struct IMAGE_EXPORT_DIRECTORY *dirp = NULL;
+	if (hdr != NULL)
+	{
+		hdr->headers = &hdr->nt;
+		hdr->opthdrsize = image.opthdrsize;
+		hdr->ntsize = image.nthdrsize;
+		memcpy(&hdr->nt, image.nt, image.nthdrsize);
+		hdr->directories = rva_to_va(hdr->headers,
+			image.nthdrsize - IMAGE_NUMBEROF_DIRECTORY_ENTRIES * sizeof(IMAGE_DATA_DIRECTORY));
+		hdr->shdrs = (IMAGE_SECTION_HEADER *)rva_to_va(hdr->headers, image.nthdrsize);
+		hdr->exports = (struct IMAGE_EXPORT_DIRECTORY *)rva_to_va(hdr->shdrspace, sizeof(hdr->shdrspace));
+		hdr->size = image.nthdrsize + sizeof(hdr->expspace) + sizeof(hdr->shdrspace);
+		dirp = hdr->exports;
+	}
+	const char **exports = exports_from_image(&image, name, expc, dirp);
 	image_unmap(&image);
 	if (exports == NULL)
 	{
@@ -378,44 +467,95 @@ static const char **exports_from_path(const char *path, char *name, size_t *expc
 }
 
 static struct IMAGE_EXPORT_DIRECTORY *add_export(
-	struct IMAGE_EXPORT_DIRECTORY *dir,
-	size_t *diralloc,
-	size_t *dirbytes,
+	struct dynmem *mem,
 	const char *dll,
 	const char *fn,
 	uint32_t i)
 {
-	if (dir == NULL)
-	{
-		return NULL;
-	}
-	if (*dirbytes > UINT32_MAX)
+	if (mem->size > UINT32_MAX)
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-		free(dir);
-		dir = NULL;
+		dynmem_free(mem);
+		return NULL;
 	}
-	size_t grow = strlen(dll) + strlen(fn) + 2;
-	size_t ptr = *dirbytes;
-	dir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(dir, diralloc, dirbytes, grow);
+	size_t lhs = strlen(dll);
+	size_t rhs = strlen(fn);
+	size_t grow = lhs + rhs + 2;
+	size_t ptr = mem->size;
+	struct IMAGE_EXPORT_DIRECTORY *dir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(mem, grow);
 	if (dir == NULL)
 	{
 		return NULL;
 	}
 	char *s = (char *)dir + ptr;
-	snprintf(s, grow, "%s.%s", dll, fn);
-	((uint32_t *)(dir + 1))[i] = ptr;
+	memcpy(s, dll, lhs);
+	s[lhs] = '.';
+	memcpy(s + lhs + 1, fn, rhs + 1);
+	((uint32_t *)rva_to_va(dir, dir->AddressOfExports))[i] = ptr;
+	if (s[lhs + 1] == '#')
+	{
+		ERRF("Export by only ordinal unimplemented!\n");
+		SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+		free(dir);
+		return NULL;
+	}
+	((uint32_t *)rva_to_va(dir, dir->AddressOfNames))[i] = ptr + lhs + 1;
+	((uint16_t *)rva_to_va(dir, dir->AddressOfOrdinals))[i] = i;
 	return dir;
 }
 
-static char *strip_suffix(char *dll)
+static uint32_t clean_name(char *dll)
 {
-	char *suffix = strrchr(dll, '.');
+	// We don't want absolute paths at all
+	char *suffix = strrchr(dll, '\\');
+	if (suffix++ != NULL)
+	{
+		char *lhs = dll;
+		while (*lhs++ = *suffix++)
+			;
+	}
+	// Strip the suffix and return it
+	// 3 letter extensions are good enough
+	suffix = strrchr(dll, '.');
+	uint32_t ext = 0;
 	if (suffix != NULL)
 	{
+		strncpy((char *)&ext, suffix, sizeof(ext));
 		*suffix = 0;
 	}
-	return dll;
+	return ext;
+}
+
+static char *append_suffix(char *name, size_t max, uint32_t suffix)
+{
+	size_t i = strlen(name);
+	size_t remaining = max - i - 1;
+	assert(remaining <= max);
+	if (remaining > sizeof(suffix))
+		remaining = sizeof(suffix);
+	strncpy(name + i, (const char *)&suffix, remaining);
+	name[i + remaining] = 0;
+	return name;
+}
+
+static BOOL install(const char *prev, const char *dir, const char *file)
+{
+	char path[2 * MAX_PATH];
+	snprintf(path, sizeof(path), "%s\\%s", dir, file);
+	return CopyFile(prev, path, FALSE);
+}
+
+static BOOL WriteFileExact(HANDLE hFile, const void *buf, uint32_t len)
+{
+	DWORD nRead;
+	do
+	{
+		if (!WriteFile(hFile, buf, len, &nRead, NULL))
+			return FALSE;
+		buf = (const char *)buf + nRead;
+		len -= nRead;
+	} while (len != 0);
+	return TRUE;
 }
 
 int main(int argc, char **argv)
@@ -426,52 +566,197 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	char prename[MAX_PATH];
+	struct fwdheader hdr;
+	memset(&hdr, 0, sizeof(hdr));
+
+	char outname[MAX_PATH];
+	char plname[MAX_PATH];
 	char refname[MAX_PATH];
 	const char *preload = argv[1];
 	const char *reference = argv[2];
 	size_t plexpc = 0;
 	size_t refexpc = 0;
-	const char **plexps = exports_from_path(preload, prename, &plexpc);
+	const char **plexps = exports_from_path(preload, plname, &plexpc, NULL);
 	if (plexps == NULL)
 	{
 		return EXIT_FAILURE;
 	}
-	for (const char **iter = plexps; *iter; iter++)
-		OUTF("\t%s\n", *iter);
-	const char **refexps = exports_from_path(reference, refname, &refexpc);
+	const char **refexps = exports_from_path(reference, refname, &refexpc, &hdr);
 	if (refexps == NULL)
 	{
 		return EXIT_FAILURE;
 	}
-	for (const char **iter = refexps; *iter; iter++)
-		OUTF("\t%s\n", *iter);
 
 	struct IMAGE_EXPORT_DIRECTORY *expdir = NULL;
-	size_t expdirbytes = 0;
-	size_t expdiralloc = 0;
 
-	if (!rva_size_bounded(SIZE_MAX, sizeof(*expdir), refexpc, sizeof(uint32_t)))
+	if (!rva_size_bounded(SIZE_MAX, sizeof(*expdir), refexpc, 5 * sizeof(uint16_t)))
 	{
 		ERRF("Number of exports too big to fit in memory!\n");
 		return EXIT_FAILURE;
 	}
-	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(
-		NULL, &expdirbytes, &expdiralloc,
-		sizeof(*expdir) + refexpc * sizeof(uint32_t));
-	uint32_t *rvas = (uint32_t *)(expdir + 1);
+	struct dynmem mem = DYNMEM_INIT;
+	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(&mem, sizeof(*expdir) + refexpc * 5 * sizeof(uint16_t));
+	if (expdir == NULL)
+	{
+		PERRF(GetLastError(), "Failed to allocate initial export directory table!");
+		return EXIT_FAILURE;
+	}
+	expdir->Characteristics = hdr.exports->Characteristics;
+	expdir->TimeDateStamp = hdr.exports->TimeDateStamp;
+	expdir->MajorVersion = hdr.exports->MajorVersion;
+	expdir->MinorVersion = hdr.exports->MinorVersion;
+	expdir->NumberOfNames = refexpc;
+	expdir->NumberOfAddresses = refexpc;
+	expdir->AddressOfExports = sizeof(*expdir);
+	expdir->AddressOfNames = expdir->AddressOfExports + sizeof(uint32_t) * refexpc;
+	expdir->AddressOfOrdinals = expdir->AddressOfNames + sizeof(uint32_t) * refexpc;
+	expdir->Base = 1;
 
-	strip_suffix(prename);
-	strip_suffix(refname);
+	uint32_t plext = clean_name(plname);
+	uint32_t refext = clean_name(refname);
+	strcpy(outname, refname);
+	snprintf(refname, sizeof(refname), "%sREF", refname);
+	if (!_stricmp(plname, outname))
+	{
+		snprintf(plname, sizeof(plname), "%sPLD", plname);
+	}
+
+	OUTF("Files: %s %s %s\n", outname, refname, plname);
 	for (size_t i = 0; i < refexpc; i++)
 	{
-		expdir = add_export(expdir, &expdirbytes, &expdiralloc, refname, refexps[i], i);
+		const char *export = refexps[i];
+		const char *dllname = (search_strtable(plexps, plexpc, export) != NULL) ? plname : refname;
+		if (dllname == plname)
+		{
+			OUTF("\tPreloading '%s'...\n", export);
+		}
+		expdir = add_export(&mem, dllname, export, i);
 		if (expdir == NULL)
 		{
-			PERRF(GetLastError(), "Failed to add export '%s' to forwarder exports!");
+			PERRF(GetLastError(), "Failed to add export '%s' to forwarder exports!", export);
 			return EXIT_FAILURE;
 		}
-		OUTF("Added export '%s'\n", (const char *)expdir + ((uint32_t *)(expdir + 1))[i]);
 	}
+
+	size_t name_rva = mem.size;
+	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(
+		&mem, strlen(append_suffix(outname, sizeof(outname), refext)) + 1
+	);
+	if (name_rva > UINT32_MAX || expdir == NULL)
+	{
+		PERRF(GetLastError(), "Failed to make room for DLL name in edata section!");
+		return EXIT_FAILURE;
+	}
+	strcpy((char *)rva_to_va(expdir, name_rva), outname);
+	expdir->Name = name_rva;
+
+	// Dynamically create the PE file
+	HANDLE hFile = CreateFileA(
+		outname,
+		GENERIC_WRITE,
+		FILE_SHARE_READ,
+		NULL,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+		NULL
+	);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		PERRF(GetLastError(), "Failed to create temporary file for forwarder!");
+		return EXIT_FAILURE;
+	}
+	memcpy(hdr.dos, DOS_STUB, sizeof(DOS_STUB));
+	uint32_t headsize = (uintptr_t)&((struct fwdheader *)0)->alignend;
+	uint32_t imgsize = headsize + mem.size;
+	if (imgsize < headsize)
+	{
+		ERRF("Export directory too big for exporting!\n");
+		return EXIT_FAILURE;
+	}
+	uint32_t count = expdir->NumberOfNames;
+	uint32_t names_rva = expdir->AddressOfNames;
+	uint32_t exports_rva = expdir->AddressOfExports;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		((uint32_t *)rva_to_va(expdir, names_rva))[i] += headsize;
+		((uint32_t *)rva_to_va(expdir, exports_rva))[i] += headsize;
+	}
+	uint32_t imgbase = 0x10000000;
+	expdir->Name += headsize;
+	expdir->AddressOfNames += headsize;
+	expdir->AddressOfExports += headsize;
+	expdir->AddressOfOrdinals += headsize;
+	IMAGE_FILE_HEADER *filhdr = &hdr.nt.h64.FileHeader;
+	filhdr->NumberOfSections = ARRAYSIZE(hdr.shdrspace);
+	filhdr->PointerToSymbolTable = 0;
+	filhdr->NumberOfSymbols = 0;
+	filhdr->SizeOfOptionalHeader = hdr.ntsize;
+	IMAGE_DATA_DIRECTORY *datadir;
+	switch (hdr.ntsize)
+	{
+		case sizeof(hdr.nt.h64):
+			IMAGE_OPTIONAL_HEADER64 *h64 = &hdr.nt.h64.OptionalHeader;
+			h64->SizeOfCode = 0;
+			h64->SizeOfInitializedData = mem.size;
+			h64->SizeOfUninitializedData = 0;
+			h64->AddressOfEntryPoint = 0;
+			h64->BaseOfCode = 0;
+			h64->ImageBase = imgbase;
+			h64->SizeOfImage = imgsize;
+			h64->SizeOfHeaders = headsize;
+			h64->CheckSum = 0;
+			h64->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+			memset(h64->DataDirectory, 0, sizeof(h64->DataDirectory));
+			datadir = &h64->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+			break;
+		case sizeof(hdr.nt.h32):
+			IMAGE_OPTIONAL_HEADER32 *h32 = &hdr.nt.h32.OptionalHeader;
+			h32->SizeOfCode = 0;
+			h32->SizeOfInitializedData = mem.size;
+			h32->SizeOfUninitializedData = 0;
+			h32->AddressOfEntryPoint = 0;
+			h32->BaseOfCode = 0;
+			h32->ImageBase = imgbase;
+			h32->SizeOfImage = imgsize;
+			h32->SizeOfHeaders = headsize;
+			h32->CheckSum = 0;
+			h32->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+			memset(h32->DataDirectory, 0, sizeof(h32->DataDirectory));
+			datadir = &h32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+			break;
+	}
+	strcpy(hdr.shdrs->Name, ".edata");
+	hdr.shdrs->Misc.VirtualSize = mem.size;
+	hdr.shdrs->VirtualAddress = imgbase + 0x1000;
+	hdr.shdrs->SizeOfRawData = 0;
+	hdr.shdrs->PointerToRawData = headsize;
+	hdr.shdrs->PointerToRelocations = 0;
+	hdr.shdrs->PointerToLinenumbers = 0;
+	hdr.shdrs->NumberOfRelocations = 0;
+	hdr.shdrs->NumberOfLinenumbers = 0;
+	hdr.shdrs->Characteristics = 0x40000040;
+
+	if (!WriteFileExact(hFile, &hdr, headsize)
+		|| !WriteFileExact(hFile, expdir, mem.size))
+	{
+		PERRF(GetLastError(), "Failed to write forwarder DLL!");
+		return EXIT_FAILURE;
+	}
+
+	OUTF("Installing DLLs!\n");
+	if (!CreateDirectoryA(INSTALL_DIR, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+	{
+		PERRF(GetLastError(), "Failed to create '%s' directory!", INSTALL_DIR);
+		return EXIT_FAILURE;
+	}
+	if (!install(preload, INSTALL_DIR, append_suffix(plname, sizeof(plname), plext))
+		|| !install(reference, INSTALL_DIR, append_suffix(refname, sizeof(refname), refext))
+		|| !install(outname, INSTALL_DIR, outname))
+	{
+		PERRF(GetLastError(), "Failed to install preload and reference DLLs!");
+		return EXIT_FAILURE;
+	}
+	OUTF("Installation Complete!\n");
+
 	return 0;
 }
