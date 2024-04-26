@@ -113,10 +113,7 @@ struct IMAGE
 	uint8_t dos[sizeof(DOS_STUB)]; \
 	union IMAGE_NT_HEADERS nt; \
 	IMAGE_SECTION_HEADER shdrspace[1]; \
-	IMAGE_EXPORT_DIRECTORY expspace; \
-	uint32_t opthdrsize; \
-	uint32_t ntsize; \
-	uint32_t size
+	IMAGE_EXPORT_DIRECTORY expspace \
 
 #define FILE_ALIGN 512
 
@@ -130,6 +127,9 @@ struct fwdheader
 	FWDHDR_BASE;
 	uint8_t alignment[2 * FILE_ALIGN - sizeof(struct fwdheader_base)];
 	uint8_t alignend;
+	uint32_t opthdrsize;
+	uint32_t ntsize;
+	uint32_t size;
 	union IMAGE_NT_HEADERS *headers;
 	IMAGE_DATA_DIRECTORY *directories;
 	struct IMAGE_EXPORT_DIRECTORY *exports;
@@ -138,6 +138,14 @@ struct fwdheader
 
 #define rva_to_va(b, rva) (void *)((uintptr_t)b + rva)
 #define aligned(ptr) !((uintptr_t)(ptr) & (uintptr_t)(sizeof(*(ptr)) - 1))
+static inline uintptr_t aligndown(uintptr_t addr, uintptr_t power)
+{
+	return addr & ~(power - 1);
+}
+static inline uintptr_t alignup(uintptr_t addr, uintptr_t power)
+{
+	return aligndown(addr + power - 1, power);
+}
 
 static BOOL rva_size_bounded(uint32_t imgsize, uint32_t rva, uint32_t nmemb, uint32_t membsize)
 {
@@ -450,8 +458,8 @@ static const char **exports_from_path(const char *path, char *name, size_t *expc
 		memcpy(&hdr->nt, image.nt, image.nthdrsize);
 		hdr->directories = rva_to_va(hdr->headers,
 			image.nthdrsize - IMAGE_NUMBEROF_DIRECTORY_ENTRIES * sizeof(IMAGE_DATA_DIRECTORY));
-		hdr->shdrs = (IMAGE_SECTION_HEADER *)rva_to_va(hdr->headers, image.nthdrsize);
-		hdr->exports = (struct IMAGE_EXPORT_DIRECTORY *)rva_to_va(hdr->shdrspace, sizeof(hdr->shdrspace));
+		hdr->shdrs = (IMAGE_SECTION_HEADER *)rva_to_va(hdr->directories, IMAGE_NUMBEROF_DIRECTORY_ENTRIES * sizeof(IMAGE_DATA_DIRECTORY));
+		hdr->exports = (struct IMAGE_EXPORT_DIRECTORY *)rva_to_va(hdr->shdrs, sizeof(hdr->shdrspace));
 		hdr->size = image.nthdrsize + sizeof(hdr->expspace) + sizeof(hdr->shdrspace);
 		dirp = hdr->exports;
 	}
@@ -548,13 +556,13 @@ static BOOL install(const char *prev, const char *dir, const char *file)
 static BOOL WriteFileExact(HANDLE hFile, const void *buf, uint32_t len)
 {
 	DWORD nRead;
-	do
+	while (len != 0)
 	{
 		if (!WriteFile(hFile, buf, len, &nRead, NULL))
 			return FALSE;
 		buf = (const char *)buf + nRead;
 		len -= nRead;
-	} while (len != 0);
+	}
 	return TRUE;
 }
 
@@ -666,13 +674,15 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	memcpy(hdr.dos, DOS_STUB, sizeof(DOS_STUB));
-	uint32_t headsize = (uintptr_t)&((struct fwdheader *)0)->alignend;
+	uint32_t headsize = offsetof(struct fwdheader, alignend);
+	uint32_t sectalign = 0x1000;
 	uint32_t imgsize = headsize + mem.size;
-	if (imgsize < headsize)
+	if (imgsize < headsize || !alignup(imgsize, sectalign))
 	{
 		ERRF("Export directory too big for exporting!\n");
 		return EXIT_FAILURE;
 	}
+	imgsize = alignup(imgsize, sectalign);
 	uint32_t count = expdir->NumberOfNames;
 	uint32_t names_rva = expdir->AddressOfNames;
 	uint32_t exports_rva = expdir->AddressOfExports;
@@ -690,7 +700,7 @@ int main(int argc, char **argv)
 	filhdr->NumberOfSections = ARRAYSIZE(hdr.shdrspace);
 	filhdr->PointerToSymbolTable = 0;
 	filhdr->NumberOfSymbols = 0;
-	filhdr->SizeOfOptionalHeader = hdr.ntsize;
+	filhdr->SizeOfOptionalHeader = hdr.opthdrsize;
 	IMAGE_DATA_DIRECTORY *datadir;
 	switch (hdr.ntsize)
 	{
@@ -702,6 +712,8 @@ int main(int argc, char **argv)
 			h64->AddressOfEntryPoint = 0;
 			h64->BaseOfCode = 0;
 			h64->ImageBase = imgbase;
+			h64->SectionAlignment = sectalign;
+			h64->FileAlignment = FILE_ALIGN;
 			h64->SizeOfImage = imgsize;
 			h64->SizeOfHeaders = headsize;
 			h64->CheckSum = 0;
@@ -717,6 +729,8 @@ int main(int argc, char **argv)
 			h32->AddressOfEntryPoint = 0;
 			h32->BaseOfCode = 0;
 			h32->ImageBase = imgbase;
+			h32->SectionAlignment = sectalign;
+			h32->FileAlignment = FILE_ALIGN;
 			h32->SizeOfImage = imgsize;
 			h32->SizeOfHeaders = headsize;
 			h32->CheckSum = 0;
@@ -725,19 +739,29 @@ int main(int argc, char **argv)
 			datadir = &h32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
 			break;
 	}
+	size_t padlen = FILE_ALIGN - (mem.size & (FILE_ALIGN - 1));
+	if (padlen == FILE_ALIGN)
+		padlen = 0;
+	OUTF("Section: %zx %zx %zx %zx\n", padlen + mem.size, mem.size, padlen, alignup(mem.size, FILE_ALIGN));
+	uint8_t pad[FILE_ALIGN - 1];
+	memset(pad, 0, sizeof(pad));
 	strcpy(hdr.shdrs->Name, ".edata");
 	hdr.shdrs->Misc.VirtualSize = mem.size;
-	hdr.shdrs->VirtualAddress = imgbase + 0x1000;
-	hdr.shdrs->SizeOfRawData = 0;
+	hdr.shdrs->VirtualAddress = imgbase + sectalign;
+	hdr.shdrs->SizeOfRawData = mem.size + padlen;
 	hdr.shdrs->PointerToRawData = headsize;
 	hdr.shdrs->PointerToRelocations = 0;
 	hdr.shdrs->PointerToLinenumbers = 0;
 	hdr.shdrs->NumberOfRelocations = 0;
 	hdr.shdrs->NumberOfLinenumbers = 0;
 	hdr.shdrs->Characteristics = 0x40000040;
+	datadir->VirtualAddress = hdr.shdrs->VirtualAddress;
+	datadir->Size = hdr.shdrs->Misc.VirtualSize;
 
+	OUTF("Headsize: %d\n", headsize);
 	if (!WriteFileExact(hFile, &hdr, headsize)
-		|| !WriteFileExact(hFile, expdir, mem.size))
+		|| !WriteFileExact(hFile, expdir, mem.size)
+		|| !WriteFileExact(hFile, pad, padlen))
 	{
 		PERRF(GetLastError(), "Failed to write forwarder DLL!");
 		return EXIT_FAILURE;
