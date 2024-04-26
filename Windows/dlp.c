@@ -629,14 +629,13 @@ int main(int argc, char **argv)
 		snprintf(plname, sizeof(plname), "%sPLD", plname);
 	}
 
-	OUTF("Files: %s %s %s\n", outname, refname, plname);
 	for (size_t i = 0; i < refexpc; i++)
 	{
 		const char *export = refexps[i];
 		const char *dllname = (search_strtable(plexps, plexpc, export) != NULL) ? plname : refname;
 		if (dllname == plname)
 		{
-			OUTF("\tPreloading '%s'...\n", export);
+			OUTF("Preloading '%s'...\n", export);
 		}
 		expdir = add_export(&mem, dllname, export, i);
 		if (expdir == NULL)
@@ -659,8 +658,10 @@ int main(int argc, char **argv)
 	expdir->Name = name_rva;
 
 	// Dynamically create the PE file
+	char tmppath[32];
+	sprintf(tmppath, "dlp-tmp-%x-%x", GetCurrentProcessId(), GetTickCount());
 	HANDLE hFile = CreateFileA(
-		outname,
+		tmppath,
 		GENERIC_WRITE,
 		FILE_SHARE_READ,
 		NULL,
@@ -673,6 +674,7 @@ int main(int argc, char **argv)
 		PERRF(GetLastError(), "Failed to create temporary file for forwarder!");
 		return EXIT_FAILURE;
 	}
+
 	memcpy(hdr.dos, DOS_STUB, sizeof(DOS_STUB));
 	uint32_t headsize = offsetof(struct fwdheader, alignend);
 	uint32_t sectalign = 0x1000;
@@ -692,6 +694,7 @@ int main(int argc, char **argv)
 		((uint32_t *)rva_to_va(expdir, exports_rva))[i] += headsize;
 	}
 	uint32_t imgbase = 0x10000000;
+	uint32_t imgsize = alignup(filesize, sectalign);
 	expdir->Name += headsize;
 	expdir->AddressOfNames += headsize;
 	expdir->AddressOfExports += headsize;
@@ -710,11 +713,11 @@ int main(int argc, char **argv)
 			h64->SizeOfInitializedData = mem.size;
 			h64->SizeOfUninitializedData = 0;
 			h64->AddressOfEntryPoint = 0;
-			h64->BaseOfCode = 0;
+			h64->BaseOfCode = imgsize;
 			h64->ImageBase = imgbase;
 			h64->SectionAlignment = sectalign;
 			h64->FileAlignment = FILE_ALIGN;
-			h64->SizeOfImage = alignup(filesize, sectalign);
+			h64->SizeOfImage = imgsize;
 			h64->SizeOfHeaders = headsize;
 			h64->CheckSum = 0;
 			h64->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
@@ -727,11 +730,11 @@ int main(int argc, char **argv)
 			h32->SizeOfInitializedData = mem.size;
 			h32->SizeOfUninitializedData = 0;
 			h32->AddressOfEntryPoint = 0;
-			h32->BaseOfCode = 0;
+			h32->BaseOfCode = imgsize;
 			h32->ImageBase = imgbase;
 			h32->SectionAlignment = sectalign;
 			h32->FileAlignment = FILE_ALIGN;
-			h32->SizeOfImage = alignup(filesize, sectalign);
+			h32->SizeOfImage = imgsize;
 			h32->SizeOfHeaders = headsize;
 			h32->CheckSum = 0;
 			h32->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
@@ -745,18 +748,18 @@ int main(int argc, char **argv)
 	OUTF("Section: %zx %zx %zx %zx\n", padlen + mem.size, mem.size, padlen, alignup(mem.size, FILE_ALIGN));
 	uint8_t pad[FILE_ALIGN - 1];
 	memset(pad, 0, sizeof(pad));
-	strcpy(hdr.shdrs->Name, ".edata");
+	strncpy(hdr.shdrs->Name, ".text", sizeof(hdr.shdrs->Name));
 	hdr.shdrs->Misc.VirtualSize = mem.size;
-	hdr.shdrs->VirtualAddress = 0;
+	hdr.shdrs->VirtualAddress = alignup(headsize, sectalign);
 	hdr.shdrs->SizeOfRawData = mem.size + padlen;
-	hdr.shdrs->PointerToRawData = 0;
+	hdr.shdrs->PointerToRawData = headsize;
 	hdr.shdrs->PointerToRelocations = 0;
 	hdr.shdrs->PointerToLinenumbers = 0;
 	hdr.shdrs->NumberOfRelocations = 0;
 	hdr.shdrs->NumberOfLinenumbers = 0;
-	hdr.shdrs->Characteristics = 0x40000040;
-	datadir->VirtualAddress = headsize;
-	datadir->Size = hdr.shdrs->Misc.VirtualSize;
+	hdr.shdrs->Characteristics = 0x60000060;
+	datadir->VirtualAddress = hdr.shdrs->VirtualAddress;
+	datadir->Size = mem.size;
 
 	OUTF("Headsize: %d\n", headsize);
 	if (!WriteFileExact(hFile, &hdr, headsize)
@@ -775,7 +778,7 @@ int main(int argc, char **argv)
 	}
 	if (!install(preload, INSTALL_DIR, append_suffix(plname, sizeof(plname), plext))
 		|| !install(reference, INSTALL_DIR, append_suffix(refname, sizeof(refname), refext))
-		|| !install(outname, INSTALL_DIR, outname))
+		|| !install(tmppath, INSTALL_DIR, outname))
 	{
 		PERRF(GetLastError(), "Failed to install preload and reference DLLs!");
 		return EXIT_FAILURE;
