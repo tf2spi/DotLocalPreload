@@ -9,6 +9,13 @@
 #include <assert.h>
 #include <stdarg.h>
 
+// Advised file alignment for PE files
+#define FILE_ALIGN 512
+
+// Clamp untrusted page sizes in PE files
+#define MIN_PAGE_SIZE FILE_ALIGN
+#define MAX_PAGE_SIZE 0x40000000u
+
 #define INSTALL_DIR "install.exe.local"
 const uint32_t DOS_STUB[] = 
 {
@@ -102,6 +109,7 @@ struct IMAGE
 	uint32_t size;
 	uint32_t opthdrsize;
 	uint32_t nthdrsize;
+	uint32_t pgsize;
 	IMAGE_DOS_HEADER *dos;
 	union IMAGE_NT_HEADERS *nt;
 	IMAGE_DATA_DIRECTORY *directories;
@@ -115,7 +123,6 @@ struct IMAGE
 	IMAGE_SECTION_HEADER shdrspace[1]; \
 	IMAGE_EXPORT_DIRECTORY expspace \
 
-#define FILE_ALIGN 512
 
 struct fwdheader_base
 {
@@ -129,6 +136,7 @@ struct fwdheader
 	uint8_t alignend;
 	uint32_t opthdrsize;
 	uint32_t ntsize;
+	uint32_t pgsize;
 	uint32_t size;
 	union IMAGE_NT_HEADERS *headers;
 	IMAGE_DATA_DIRECTORY *directories;
@@ -136,7 +144,6 @@ struct fwdheader
 	IMAGE_SECTION_HEADER *shdrs;
 };
 
-#define rva_to_va(b, rva) (void *)((uintptr_t)b + rva)
 #define aligned(ptr) !((uintptr_t)(ptr) & (uintptr_t)(sizeof(*(ptr)) - 1))
 static inline uintptr_t aligndown(uintptr_t addr, uintptr_t power)
 {
@@ -146,10 +153,31 @@ static inline uintptr_t alignup(uintptr_t addr, uintptr_t power)
 {
 	return aligndown(addr + power - 1, power);
 }
+static inline uintptr_t cleanpagesize(uintptr_t pgsize)
+{
+	if (pgsize < MIN_PAGE_SIZE)
+		return MIN_PAGE_SIZE;
+	if (pgsize > MAX_PAGE_SIZE)
+		return MAX_PAGE_SIZE;
 
+	// Nice bit trick to get the biggest power of 2 below this quickly
+	uintptr_t power = pgsize;
+	while (power & (power - 1))
+		power &= (power - 1);
+	return alignup(pgsize, power);
+}
+
+#define rva_to_va(b, rva) (void *)((uintptr_t)b + rva)
 static BOOL rva_size_bounded(uint32_t imgsize, uint32_t rva, uint32_t nmemb, uint32_t membsize)
 {
 	return rva < imgsize && (imgsize - rva) / membsize > nmemb;
+}
+
+static SYSTEM_INFO sysinfo;
+static LPSYSTEM_INFO GetSystemInfoStatic(void)
+{
+	GetSystemInfo(&sysinfo);
+	return &sysinfo;
 }
 
 static int sort_string(void *unused, const void *lhs, const void *rhs)
@@ -240,7 +268,12 @@ static struct IMAGE image_map(const char *image)
 {
 	struct IMAGE img;
 	memset(&img, 0, sizeof(img));
-	HMODULE hModule = LoadLibraryExA(image, NULL, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+	HMODULE hModule = LoadLibraryExA(
+		image,
+		NULL,
+		LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE
+		| LOAD_LIBRARY_AS_IMAGE_RESOURCE
+	);
 	MODULEINFO info;
 	if (hModule == NULL)
 	{
@@ -250,10 +283,9 @@ static struct IMAGE image_map(const char *image)
 
 	// LoadLibrary mapped everything properly so trust the headers
 	// Additionally, hModule uses low bits as flags so mask those off
-	// to get the base address. For all architectures we care about, page
-	// size is 4KiB.
+	// to get the base address. We know it's aligned on a page address.
 	img.module = hModule;
-	img.base = (void *)((uintptr_t)hModule & ~0xfff);
+	img.base = (void *)((uintptr_t)hModule & ~(uintptr_t)(GetSystemInfoStatic()->dwPageSize - 1));
 	img.dos = (IMAGE_DOS_HEADER *)img.base;
 	img.nt = (union IMAGE_NT_HEADERS *)rva_to_va(img.dos, img.dos->e_lfanew);
 	switch (img.nt->h32.OptionalHeader.Magic)
@@ -262,6 +294,7 @@ static struct IMAGE image_map(const char *image)
 		    img.directories = &img.nt->h64.OptionalHeader.DataDirectory[0];
 		    img.dircnt = img.nt->h64.OptionalHeader.NumberOfRvaAndSizes;
 		    img.size = img.nt->h64.OptionalHeader.SizeOfImage;
+		    img.pgsize = img.nt->h64.OptionalHeader.SectionAlignment;
 		    img.nthdrsize = sizeof(img.nt->h64);
 		    img.opthdrsize = sizeof(img.nt->h64.OptionalHeader);
 		    break;
@@ -269,6 +302,7 @@ static struct IMAGE image_map(const char *image)
 		    img.directories = &img.nt->h32.OptionalHeader.DataDirectory[0];
 		    img.dircnt = img.nt->h32.OptionalHeader.NumberOfRvaAndSizes;
 		    img.size = img.nt->h32.OptionalHeader.SizeOfImage;
+		    img.pgsize = img.nt->h32.OptionalHeader.SectionAlignment;
 		    img.nthdrsize = sizeof(img.nt->h32);
 		    img.opthdrsize = sizeof(img.nt->h32.OptionalHeader);
 		    break;
@@ -455,6 +489,7 @@ static const char **exports_from_path(const char *path, char *name, size_t *expc
 		hdr->headers = &hdr->nt;
 		hdr->opthdrsize = image.opthdrsize;
 		hdr->ntsize = image.nthdrsize;
+		hdr->pgsize = image.pgsize;
 		memcpy(&hdr->nt, image.nt, image.nthdrsize);
 		hdr->directories = rva_to_va(hdr->headers,
 			image.nthdrsize - IMAGE_NUMBEROF_DIRECTORY_ENTRIES * sizeof(IMAGE_DATA_DIRECTORY));
@@ -677,7 +712,7 @@ int main(int argc, char **argv)
 
 	memcpy(hdr.dos, DOS_STUB, sizeof(DOS_STUB));
 	uint32_t headsize = offsetof(struct fwdheader, alignend);
-	uint32_t sectalign = 0x1000;
+	uint32_t sectalign = cleanpagesize(hdr.pgsize);
 	uint32_t filesize = alignup(headsize + mem.size, FILE_ALIGN);
 	uint32_t imgsize = alignup(headsize, sectalign) + alignup(mem.size, sectalign);
 	if (filesize < headsize || imgsize < filesize)
