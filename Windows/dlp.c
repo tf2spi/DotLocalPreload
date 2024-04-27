@@ -696,9 +696,12 @@ int main(int argc, char **argv)
 	uint32_t refnamec = hdr.exports->NumberOfNames;
 	refexpc = hdr.exports->NumberOfAddresses;
 
-	// TODO: The bound can be more efficient here
+	// Allocate memory for exported function RVAs as well as exported name RVAs/ordinals
 	struct IMAGE_EXPORT_DIRECTORY *expdir = NULL;
-	if (!rva_size_bounded(SIZE_MAX, sizeof(*expdir), refexpc, 5 * sizeof(uint16_t)))
+	if (!rva_size_bounded(SIZE_MAX, sizeof(*expdir), refexpc, sizeof(uint32_t))
+		|| !rva_size_bounded(SIZE_MAX,
+			sizeof(*expdir) + refnamec * sizeof(uint32_t),
+			refnamec, sizeof(uint32_t) + sizeof(uint16_t)))
 	{
 		ERRF("Number of exports too big to fit in memory!\n");
 		return EXIT_FAILURE;
@@ -795,7 +798,6 @@ int main(int argc, char **argv)
 		ERRF("Export directory too big for exporting!\n");
 		return EXIT_FAILURE;
 	}
-	uint64_t imgbase = (uint64_t)0x180000000;
 	IMAGE_FILE_HEADER *filhdr = &hdr.nt.h64.FileHeader;
 	filhdr->NumberOfSections = ARRAYSIZE(hdr.shdrspace);
 	filhdr->PointerToSymbolTable = 0;
@@ -811,7 +813,7 @@ int main(int argc, char **argv)
 			h64->SizeOfUninitializedData = 0;
 			h64->AddressOfEntryPoint = 0;
 			h64->BaseOfCode = sectalign;
-			h64->ImageBase = imgbase;
+			h64->ImageBase = aligndown(h64->ImageBase, sectalign);
 			h64->SectionAlignment = sectalign;
 			h64->FileAlignment = FILE_ALIGN;
 			h64->SizeOfImage = imgsize;
@@ -828,7 +830,7 @@ int main(int argc, char **argv)
 			h32->SizeOfUninitializedData = 0;
 			h32->AddressOfEntryPoint = 0;
 			h32->BaseOfCode = sectalign;
-			h32->ImageBase = imgbase;
+			h32->ImageBase = aligndown(h32->ImageBase, sectalign);
 			h32->SectionAlignment = sectalign;
 			h32->FileAlignment = FILE_ALIGN;
 			h32->SizeOfImage = imgsize;
@@ -863,7 +865,9 @@ int main(int argc, char **argv)
 	uint32_t ordinals_rva = expdir->AddressOfOrdinals;
 	uint16_t *ordinals = ((uint16_t *)rva_to_va(expdir, ordinals_rva));
 
-	// Sort the table
+	// Sort the name table like it should be in a DLL.
+	// Then, we can recover the ordinals by sorting the reference exports
+	// and then search for it by name which will return both name and ordinal.
 	sort_nametable(names, namei, expdir);
 	sort_exptable(refexps, refexpc);
 	for (uint32_t i = 0, count = expdir->NumberOfNames; i < count; i++)
@@ -878,12 +882,6 @@ int main(int argc, char **argv)
 			ordinals[i] = selected->ordinal;
 		else
 			ERRF("Export %u not found in export table?\n", i);
-#if 0 
-		OUTF("Export: '%s' -> '%s' @ %hu\n",
-			(const char *)rva_to_va(expdir, names[i]),
-			(const char *)rva_to_va(expdir, exports[ordinal]),
-			ordinal);
-#endif
 		names[i] += datadir->VirtualAddress;
 	}
 	for (uint32_t i = 0, count = expdir->NumberOfAddresses; i < count; i++)
