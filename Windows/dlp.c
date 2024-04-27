@@ -144,6 +144,12 @@ struct fwdheader
 	IMAGE_SECTION_HEADER *shdrs;
 };
 
+struct export
+{
+	char *name;
+	uint16_t ordinal;
+};
+
 #define aligned(ptr) !((uintptr_t)(ptr) & (uintptr_t)(sizeof(*(ptr)) - 1))
 static inline uintptr_t aligndown(uintptr_t addr, uintptr_t power)
 {
@@ -180,14 +186,42 @@ static LPSYSTEM_INFO GetSystemInfoStatic(void)
 	return &sysinfo;
 }
 
-static int sort_string(void *unused, const void *lhs, const void *rhs)
+static int sort_rva(void *ctx, const uint32_t *lhs, const uint32_t *rhs)
 {
-	(void)unused;
-	return strcmp(*(const char **)lhs, *(const char **)rhs);
+	const char *base = (const char *)ctx;
+	return strcmp(base + *lhs, base + *rhs);
 }
 
-#define sort_strtable(table, count) qsort_s((table), (count), sizeof(*(table)), sort_string, NULL)
-#define search_strtable(table, count, needle) ((char **)bsearch_s(&(needle), (table), (count), sizeof(*(table)), sort_string, NULL))
+static int sort_exports(void *unused, const void *lhs, const void *rhs)
+{
+	(void)unused;
+	const struct export *exportl = (const struct export *)lhs;
+	const struct export *exportr = (const struct export *)rhs;
+
+	// Sort by name then by ordinal
+	if (exportl->name != NULL && exportr->name != NULL)
+		return strcmp(exportl->name, exportr->name);
+	else if (exportl->name != NULL && exportr->name == NULL)
+		return -1;
+	else if (exportl->name == NULL && exportr->name != NULL)
+		return 1;
+	return (int)exportl->ordinal - (int)exportr->ordinal;
+}
+
+static void sort_nametable(uint32_t *names, uint32_t count, struct IMAGE_EXPORT_DIRECTORY *dir)
+{
+	qsort_s(names, count, sizeof(*names), sort_rva, dir);
+}
+
+static void sort_exptable(struct export *table, size_t count)
+{
+	qsort_s(table, count, sizeof(*table), sort_exports, NULL);
+}
+
+static struct export *search_exptable(struct export *table, size_t count, const struct export needle)
+{
+	return (struct export *)bsearch_s(&needle, table, count, sizeof(*table), sort_exports, NULL);
+}
 
 // Free the memory if the grow fails
 #define DYNMEM_INIT {NULL, 0, 0}
@@ -314,32 +348,40 @@ static struct IMAGE image_map(const char *image)
 	return img;
 }
 
-static char **exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, size_t *expc)
+static struct export *exports_from_dir(const void *base, size_t imgsize, const struct IMAGE_EXPORT_DIRECTORY *expdir, size_t *expc)
 {
+	assert(expc != NULL);
 	struct dynmem mem = DYNMEM_INIT;
-	char **exports = NULL;
-	if (!rva_size_bounded(SIZE_MAX - sizeof(*exports), 0, expdir->NumberOfNames, sizeof(*exports)))
+	struct export *exports = NULL;
+	size_t addrcount = expdir->NumberOfAddresses;
+	size_t namecount = expdir->NumberOfNames;
+	if (namecount > addrcount)
+	{
+		SetLastError(ERROR_INVALID_DATA);
+		return NULL;
+	}
+	if (!rva_size_bounded(SIZE_MAX, 0, addrcount, sizeof(*exports)))
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 		return NULL;
 	}
-	uint32_t *names = rva_to_va(base, expdir->AddressOfNames);
-	uint16_t *ordinals = rva_to_va(base, expdir->AddressOfOrdinals);
-	size_t count = expdir->NumberOfNames;
-
-	exports = (char **)dynmem_grow(&mem, (count + 1) * sizeof(*exports));
+	exports = (struct export *)dynmem_grow(&mem, addrcount * sizeof(*exports));
 	if (exports == NULL)
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 		return NULL;
 	}
-
+	for (uint32_t i = 0; i < addrcount; i++)
+	{
+		exports[i].ordinal = i;
+		exports[i].name = NULL;
+	}
 
 	// The tables must be in bounds for the image
-	if (!rva_size_bounded(imgsize, expdir->AddressOfNames, count, sizeof(*names))
-		|| !rva_size_bounded(imgsize, expdir->AddressOfOrdinals, count, sizeof(*ordinals))
-		|| !aligned(names)
-		|| !aligned(ordinals))
+	uint32_t *names = rva_to_va(base, expdir->AddressOfNames);
+	uint16_t *ordinals = rva_to_va(base, expdir->AddressOfOrdinals);
+	if (!rva_size_bounded(imgsize, expdir->AddressOfNames, namecount, sizeof(*names))
+		|| !rva_size_bounded(imgsize, expdir->AddressOfOrdinals, namecount, sizeof(*ordinals)))
 	{
 		SetLastError(ERROR_INVALID_DATA);
 		return NULL;
@@ -354,54 +396,48 @@ static char **exports_from_dir(const void *base, size_t imgsize, const struct IM
 		return NULL;
 	}
 
-	for (uint32_t i = 0; i < count; i++)
+	for (uint32_t i = 0; i < namecount; i++)
 	{
-		char ord[8];
-		const char *s;
-		size_t slen;
+		uint16_t ordinal = ordinals[i];
+		if (ordinal >= addrcount || names[i] == 0 || names[i] >= imgsize)
+		{
+			continue;
+		}
+		const char *s = (const char *)rva_to_va(base, names[i]);
+		size_t slen = strnlen(s, imgsize - names[i]);
 
-		if (names[i] > 0 && names[i] < imgsize)
-		{
-			s = (const char *)rva_to_va(base, names[i]);
-			slen = strnlen(s, imgsize - names[i]);
-		}
-		else
-		{
-			slen = sprintf(ord, "#%hu", (uint16_t)(ordinals[i] + expdir->Base));
-			s = ord;
-		}
 		size_t prev = mem.size;
-		exports = (char **)dynmem_grow(&mem, slen + 1);
+		exports = (struct export *)dynmem_grow(&mem, slen + 1);
 		if (exports == NULL)
 			return NULL;
-
 		char *dst = (char *)exports + prev;
-		exports[i] = (char *)prev; 
+		exports[ordinal].name = (char *)prev; 
 		memcpy(dst, s, slen);
 		dst[slen] = 0;
 	}
-	exports[count] = NULL;
 
 	// realloc is still free to move memory or fail
 	// while shrinking memory so check for that.
 	void *tmp = realloc(exports, mem.size);
 	if (tmp != NULL)
 	{
-		exports = (const char **)tmp;
+		exports = (struct export *)tmp;
 	}
-	if (expc != NULL)
+
+	// Relocate name entries
+	for (size_t i = 0; i < addrcount; i++)
 	{
-		*expc = count;
+		if (exports[i].name != NULL)
+			exports[i].name += (uintptr_t)exports;
 	}
-	for (const char **iter = exports; *iter; iter++)
-		*iter += (uintptr_t)exports;
-	sort_strtable(exports, expdir->NumberOfNames);
+
+	*expc = addrcount;
 	return exports;
 }
 
-static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc, struct IMAGE_EXPORT_DIRECTORY *dirp)
+static struct export *exports_from_image(struct IMAGE *image, char *name, size_t *expc, struct IMAGE_EXPORT_DIRECTORY *dirp)
 {
-	assert(image != NULL);
+	assert(image != NULL && expc != NULL);
 	if (image->error)
 	{
 		return NULL;
@@ -419,13 +455,13 @@ static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc, 
 		|| expdirptr->VirtualAddress == 0
 		|| expdirptr->Size < sizeof(struct IMAGE_EXPORT_DIRECTORY))
 	{
-		char **exports = malloc(sizeof(*exports));
+		struct export *exports = malloc(1);
 		if (exports == NULL)
 		{
 			image->error = ERROR_NOT_ENOUGH_MEMORY;
 			return NULL;
 		}
-		*exports = NULL;
+		*expc = 0;
 		return exports;
 	}
 	IMAGE_DATA_DIRECTORY expdir = *expdirptr;
@@ -463,8 +499,6 @@ static char **exports_from_image(struct IMAGE *image, char *name, size_t *expc, 
 		name[slen] = 0;
 	}
 
-	// They should be sorted but we're processing unverified input
-	// and we need to consider that ordinals are converted to names.
 	return exports_from_dir(base, imgsize, &directory, expc);
 }
 
@@ -474,7 +508,7 @@ __declspec(dllexport) int HelloWorld(void)
 	return 0;
 }
 
-static const char **exports_from_path(const char *path, char *name, size_t *expc, struct fwdheader *hdr)
+static struct export *exports_from_path(const char *path, char *name, size_t *expc, struct fwdheader *hdr)
 {
 	struct IMAGE image = image_map(path);
 	if (!image.module)
@@ -498,7 +532,7 @@ static const char **exports_from_path(const char *path, char *name, size_t *expc
 		hdr->size = image.nthdrsize + sizeof(hdr->expspace) + sizeof(hdr->shdrspace);
 		dirp = hdr->exports;
 	}
-	const char **exports = exports_from_image(&image, name, expc, dirp);
+	struct export *exports = exports_from_image(&image, name, expc, dirp);
 	image_unmap(&image);
 	if (exports == NULL)
 	{
@@ -509,41 +543,71 @@ static const char **exports_from_path(const char *path, char *name, size_t *expc
 	return exports;
 }
 
+static void print_export(const struct IMAGE_EXPORT_DIRECTORY *dir, uint32_t i)
+{
+	const char *expname = (const char *)rva_to_va(dir,
+		((uint32_t *)rva_to_va(dir, dir->AddressOfNames))[i]
+	);
+	const uint16_t unbiased = ((uint16_t *)rva_to_va(dir, dir->AddressOfOrdinals))[i];
+	if (unbiased < dir->NumberOfAddresses)
+	{
+		const char *fwd = (const char *)rva_to_va(dir,
+			((uint32_t *)rva_to_va(dir, dir->AddressOfNames))[i]
+		);
+		OUTF("'%s' -> '%s' @ %hu\n", expname, fwd, unbiased);
+	}
+}
+
 static struct IMAGE_EXPORT_DIRECTORY *add_export(
 	struct dynmem *mem,
+	uint32_t expc,
 	const char *dll,
-	const char *fn,
-	uint32_t i)
+	const struct export fn,
+	uint32_t *ip)
 {
-	if (mem->size > UINT32_MAX)
+	char ord[8];
+	char *expfunc = fn.name;
+	struct IMAGE_EXPORT_DIRECTORY *dir = mem->mem;
+	if (expfunc == NULL)
+	{
+		sprintf(ord, "#%hu", fn.ordinal + dir->Base);
+		expfunc = ord;
+	}
+	size_t lhs = strlen(dll);
+	size_t rhs = strlen(expfunc);
+	size_t grow = lhs + rhs + 2;
+	size_t ptr = mem->size;
+	dir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(mem, grow);
+	if (dir == NULL || mem->size > UINT32_MAX)
 	{
 		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
 		dynmem_free(mem);
 		return NULL;
 	}
-	size_t lhs = strlen(dll);
-	size_t rhs = strlen(fn);
-	size_t grow = lhs + rhs + 2;
-	size_t ptr = mem->size;
-	struct IMAGE_EXPORT_DIRECTORY *dir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(mem, grow);
-	if (dir == NULL)
-	{
-		return NULL;
-	}
 	char *s = (char *)dir + ptr;
 	memcpy(s, dll, lhs);
 	s[lhs] = '.';
-	memcpy(s + lhs + 1, fn, rhs + 1);
-	((uint32_t *)rva_to_va(dir, dir->AddressOfExports))[i] = ptr;
-	if (s[lhs + 1] == '#')
+	memcpy(s + lhs + 1, expfunc, rhs + 1);
+
+	// Ordinals correspond to entries in the export address table
+	// so if the index overflows, the operation's a failure.
+	uint16_t unbiased = fn.ordinal;
+	if (unbiased >= expc)
 	{
-		ERRF("Export by only ordinal unimplemented!\n");
-		SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-		free(dir);
+		ERRF("unbiased: %d, expc: %d\n", unbiased, (int)expc);
+		SetLastError(ERROR_INVALID_DATA);
+		dynmem_free(mem);
 		return NULL;
 	}
-	((uint32_t *)rva_to_va(dir, dir->AddressOfNames))[i] = ptr + lhs + 1;
-	((uint16_t *)rva_to_va(dir, dir->AddressOfOrdinals))[i] = i;
+	((uint32_t *)rva_to_va(dir, dir->AddressOfExports))[unbiased] = ptr;
+	if (fn.name != NULL)
+	{
+		uint32_t i = *ip;
+		// Set RVA of name to 0 if it is not present
+		((uint32_t *)rva_to_va(dir, dir->AddressOfNames))[i] = (ptr + lhs + 1);
+		((uint16_t *)rva_to_va(dir, dir->AddressOfOrdinals))[i] = unbiased;
+		*ip = i + 1;
+	}
 	return dir;
 }
 
@@ -619,26 +683,33 @@ int main(int argc, char **argv)
 	const char *reference = argv[2];
 	size_t plexpc = 0;
 	size_t refexpc = 0;
-	const char **plexps = exports_from_path(preload, plname, &plexpc, NULL);
+	struct export *plexps = exports_from_path(preload, plname, &plexpc, NULL);
 	if (plexps == NULL)
 	{
 		return EXIT_FAILURE;
 	}
-	const char **refexps = exports_from_path(reference, refname, &refexpc, &hdr);
+	struct export *refexps = exports_from_path(reference, refname, &refexpc, &hdr);
 	if (refexps == NULL)
 	{
 		return EXIT_FAILURE;
 	}
+	uint32_t refnamec = hdr.exports->NumberOfNames;
+	refexpc = hdr.exports->NumberOfAddresses;
 
+	// TODO: The bound can be more efficient here
 	struct IMAGE_EXPORT_DIRECTORY *expdir = NULL;
-
 	if (!rva_size_bounded(SIZE_MAX, sizeof(*expdir), refexpc, 5 * sizeof(uint16_t)))
 	{
 		ERRF("Number of exports too big to fit in memory!\n");
 		return EXIT_FAILURE;
 	}
 	struct dynmem mem = DYNMEM_INIT;
-	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(&mem, sizeof(*expdir) + refexpc * 5 * sizeof(uint16_t));
+	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(
+		&mem,
+		sizeof(*expdir)
+		+ refnamec * 3 * sizeof(uint16_t)
+		+ refexpc * sizeof(uint32_t)
+	);
 	if (expdir == NULL)
 	{
 		PERRF(GetLastError(), "Failed to allocate initial export directory table!");
@@ -648,12 +719,11 @@ int main(int argc, char **argv)
 	expdir->TimeDateStamp = hdr.exports->TimeDateStamp;
 	expdir->MajorVersion = hdr.exports->MajorVersion;
 	expdir->MinorVersion = hdr.exports->MinorVersion;
-	expdir->NumberOfNames = refexpc;
-	expdir->NumberOfAddresses = refexpc;
+	expdir->NumberOfAddresses = hdr.exports->NumberOfAddresses;
 	expdir->AddressOfExports = sizeof(*expdir);
 	expdir->AddressOfNames = expdir->AddressOfExports + sizeof(uint32_t) * refexpc;
-	expdir->AddressOfOrdinals = expdir->AddressOfNames + sizeof(uint32_t) * refexpc;
-	expdir->Base = 1;
+	expdir->AddressOfOrdinals = expdir->AddressOfNames + sizeof(uint32_t) * refnamec;
+	expdir->Base = hdr.exports->Base;
 
 	uint32_t plext = clean_name(plname);
 	uint32_t refext = clean_name(refname);
@@ -664,22 +734,27 @@ int main(int argc, char **argv)
 		snprintf(plname, sizeof(plname), "%sPLD", plname);
 	}
 
+	sort_exptable(plexps, plexpc);
+	uint32_t namei = 0;
 	for (size_t i = 0; i < refexpc; i++)
 	{
-		const char *export = refexps[i];
-		const char *dllname = (search_strtable(plexps, plexpc, export) != NULL) ? plname : refname;
+		const struct export export = refexps[i];
+		const char *dllname = (search_exptable(plexps, plexpc, export) != NULL) ? plname : refname;
 		if (dllname == plname)
 		{
-			OUTF("Preloading '%s'...\n", export);
+			if (export.name != NULL)
+				OUTF("Preloading '%s'...\n", export.name);
+			else
+				OUTF("Preloading '#%hu'...\n", export.ordinal);
 		}
-		expdir = add_export(&mem, dllname, export, i);
+		expdir = add_export(&mem, refexpc, dllname, export, &namei);
 		if (expdir == NULL)
 		{
 			PERRF(GetLastError(), "Failed to add export '%s' to forwarder exports!", export);
 			return EXIT_FAILURE;
 		}
 	}
-
+	expdir->NumberOfNames = namei;
 	size_t name_rva = mem.size;
 	expdir = (struct IMAGE_EXPORT_DIRECTORY *)dynmem_grow(
 		&mem, strlen(append_suffix(outname, sizeof(outname), refext)) + 1
@@ -781,13 +856,39 @@ int main(int argc, char **argv)
 	hdr.shdrs->Characteristics = 0x40000040;
 	datadir->VirtualAddress = hdr.shdrs->VirtualAddress;
 	datadir->Size = mem.size;
-	uint32_t count = expdir->NumberOfNames;
 	uint32_t names_rva = expdir->AddressOfNames;
+	uint32_t *names = ((uint32_t *)rva_to_va(expdir, names_rva));
 	uint32_t exports_rva = expdir->AddressOfExports;
-	for (uint32_t i = 0; i < count; i++)
+	uint32_t *exports = ((uint32_t *)rva_to_va(expdir, exports_rva));
+	uint32_t ordinals_rva = expdir->AddressOfOrdinals;
+	uint16_t *ordinals = ((uint16_t *)rva_to_va(expdir, ordinals_rva));
+
+	// Sort the table
+	sort_nametable(names, namei, expdir);
+	sort_exptable(refexps, refexpc);
+	for (uint32_t i = 0, count = expdir->NumberOfNames; i < count; i++)
 	{
-		((uint32_t *)rva_to_va(expdir, names_rva))[i] += datadir->VirtualAddress;
-		((uint32_t *)rva_to_va(expdir, exports_rva))[i] += datadir->VirtualAddress;
+		struct export export =
+		{
+			(char *)rva_to_va(expdir, names[i]),
+			(uint16_t)~0,
+		};
+		struct export *selected = search_exptable(refexps, refexpc, export);
+		if (selected != NULL)
+			ordinals[i] = selected->ordinal;
+		else
+			ERRF("Export %u not found in export table?\n", i);
+#if 0 
+		OUTF("Export: '%s' -> '%s' @ %hu\n",
+			(const char *)rva_to_va(expdir, names[i]),
+			(const char *)rva_to_va(expdir, exports[ordinal]),
+			ordinal);
+#endif
+		names[i] += datadir->VirtualAddress;
+	}
+	for (uint32_t i = 0, count = expdir->NumberOfAddresses; i < count; i++)
+	{
+		exports[i] += datadir->VirtualAddress;
 	}
 	expdir->Name += datadir->VirtualAddress;
 	expdir->AddressOfNames += datadir->VirtualAddress;
